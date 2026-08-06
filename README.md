@@ -31,6 +31,7 @@
     "AllowedOrigins": ["https://<unjのオリジン>", "https://<unj-rezeのオリジン>"],
     "AllowedMethods": ["GET", "HEAD"],
     "AllowedHeaders": ["*"],
+    "ExposeHeaders": ["Content-Encoding", "Content-Length"],
     "MaxAgeSeconds": 86400
   }
 ]
@@ -55,20 +56,39 @@
 - 上限 1MB、マジックバイトで jpeg / png / gif / webp のみ許可
 - `nsfwCheck=1` のとき Workers AI でモデレーション
 
-### POST `/text?kind=<kind>` — テキストアップロード（新規）
+### POST `/text?kind=<kind>[&gzip=1]` — テキストアップロード（新規）
 
 - body: **URLエンコードしない UTF-8 の生テキスト**
 - `X-Request-Hash` = `sha256(kind + "\n" + text + UPLOAD_SECRET_PEPPER)`
+  （`text` は**展開後**の文字列。gzip の有無でハッシュは変わらない）
 
-| `kind` | content_type | キー | Content-Type | 上限 | 検証 |
-|---|---|---|---|---|---|
-| `mml` | 2048 | `mml/<16hex>.mml` | `text/plain; charset=utf-8` | 256KB | — |
-| `encrypt` | 4096 | `encrypt/<16hex>.txt` | `text/plain; charset=utf-8` | 64KB | — |
-| `mv` | 8192 | `mv/<16hex>.json` | `application/json; charset=utf-8` | 512KB | `JSON.parse` |
-| `game` | 16384 | `game/<16hex>.json` | `application/json; charset=utf-8` | 1MB | `JSON.parse` |
+| `kind` | content_type | キー | Content-Type | 転送上限 | 展開後上限 | 検証 |
+|---|---|---|---|---|---|---|
+| `mml` | 2048 | `mml/<16hex>.mml` | `text/plain; charset=utf-8` | 256KB | 256KB | — |
+| `encrypt` | 4096 | `encrypt/<16hex>.txt` | `text/plain; charset=utf-8` | 64KB | 64KB | — |
+| `mv` | 8192 | `mv/<16hex>.json` | `application/json; charset=utf-8` | 512KB | 4MB | `JSON.parse` |
+| `game` | 16384 | `game/<16hex>.json` | `application/json; charset=utf-8` | 512KB | 8MB | `JSON.parse` |
 
 共通の検証: 空 body 拒否 / バイト長で上限判定 / UTF-8 として不正なら拒否 /
 制御文字（`\t` `\n` `\r` 以外）を含むなら拒否。
+
+#### `gzip=1`（`mv` / `game` は必須と考えてよい）
+
+`gzip=1` を付けると、body を gzip 圧縮したバイト列として送れる。Worker は検証のために
+展開するが、**R2 には圧縮されたまま保存し `Content-Encoding: gzip` を付ける**。
+R2 は自動 gzip をしないので、これをやらないと再生のたびに原文サイズを丸ごと転送することになる。
+
+読み出し側は `fetch()` がブラウザ側で透過的に展開するため、**デコード用のコードは一切不要**。
+
+実測（ゲーム manifest 255617 文字 / 259525 バイト）:
+
+| | サイズ |
+|---|---|
+| 原文 | 259525 バイト |
+| gzip 後 | 8943 バイト（**29倍**） |
+
+展開後上限は圧縮爆弾対策も兼ねている。チャンクごとに積算して上限で打ち切るので、
+8MB に展開される 8KB の gzip を投げても Worker のメモリは食われない。
 
 **`mml` は生MMLではなく `encodeMml()` の出力を上げること。**
 生MMLは11トラックで45000文字（minify後39450文字）に達するが、`encodeMml` は
@@ -93,20 +113,46 @@ gzip + base64url（`z.` 接頭辞）なので実際に送るのは数KBに収ま
 
 ## クライアント実装例
 
+### アップロード
+
 ```ts
-const uploadText = async (kind: "mml" | "encrypt" | "mv" | "game", text: string) => {
+const gzip = async (text: string) =>
+  new Response(
+    new Response(new TextEncoder().encode(text)).body!.pipeThrough(
+      new CompressionStream("gzip"),
+    ),
+  ).arrayBuffer();
+
+const uploadText = async (
+  kind: "mml" | "encrypt" | "mv" | "game",
+  text: string,
+) => {
+  // mv/game は圧縮が桁で効く。mml/encrypt は圧縮済みなので素で送る
+  const useGzip = kind === "mv" || kind === "game";
   const requestHash = await sha256(`${kind}\n${text}` + UPLOAD_SECRET_PEPPER);
-  const res = await fetch(`${CLOUDFLARE_URL}/text?kind=${kind}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "text/plain; charset=utf-8",
-      Authorization: `Client-ID ${CLIENT_ID}`,
-      "X-Request-Hash": requestHash,
+  const res = await fetch(
+    `${CLOUDFLARE_URL}/text?kind=${kind}${useGzip ? "&gzip=1" : ""}`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "text/plain; charset=utf-8",
+        Authorization: `Client-ID ${CLIENT_ID}`,
+        "X-Request-Hash": requestHash,
+      },
+      body: useGzip ? await gzip(text) : text,
     },
-    body: text,
-  });
+  );
   return res.json(); // { data: { link, delete_id, delete_hash } }
 };
+```
+
+### 読み出し
+
+gzip で置いたものも、ブラウザが `Content-Encoding` を見て自動で展開する。
+
+```ts
+const manifest = await fetch(contentData).then((r) => r.json()); // mv / game
+const mml = await fetch(contentData).then((r) => r.text());      // mml / encrypt
 ```
 
 ## セットアップ

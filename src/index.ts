@@ -56,7 +56,8 @@ interface TextKindConfig {
 	prefix: string;
 	extension: string;
 	contentType: string;
-	maxBytes: number;
+	maxBytes: number; // 転送・保存されるバイト数の上限 (gzip時は圧縮後)
+	maxDecodedBytes: number; // 展開後のバイト数の上限 (zip bomb 対策)
 	json: boolean; // JSONとしてパースできることを必須にするか
 }
 
@@ -65,19 +66,23 @@ const TEXT_KINDS: Record<string, TextKindConfig> = {
 	// 中身は @onjmin/dtm の encodeMml 出力 (`z.` = gzip+base64url / `u.` = URLエンコード)。
 	// 生MMLは11トラックで45000文字を超えることがあり、`z.` なら1割弱まで縮むが、
 	// CompressionStream が無い環境の `u.` フォールバックは逆に膨らむので上限は広めに取る。
+	// 既に圧縮済みなので gzip 再圧縮の効果はなく、両上限を同値にしてある。
 	mml: {
 		prefix: "mml",
 		extension: "mml",
 		contentType: "text/plain; charset=utf-8",
 		maxBytes: 256 * 1024,
+		maxDecodedBytes: 256 * 1024,
 		json: false,
 	},
 	// 4096: 暗号レスのデータ
+	// AES-GCM 出力の base64url。圧縮は効かない。
 	encrypt: {
 		prefix: "encrypt",
 		extension: "txt",
 		contentType: "text/plain; charset=utf-8",
 		maxBytes: 64 * 1024,
+		maxDecodedBytes: 64 * 1024,
 		json: false,
 	},
 	// 8192: MV作成のデータ
@@ -86,14 +91,18 @@ const TEXT_KINDS: Record<string, TextKindConfig> = {
 		extension: "json",
 		contentType: "application/json; charset=utf-8",
 		maxBytes: 512 * 1024,
+		maxDecodedBytes: 4 * 1024 * 1024,
 		json: true,
 	},
 	// 16384: ゲーム作成のデータ
+	// スプライトやマップ込みで実測25万文字を超える。生で置くと再生のたびに
+	// 同じ量を転送することになるので gzip 保存を前提に転送上限を絞ってある。
 	game: {
 		prefix: "game",
 		extension: "json",
 		contentType: "application/json; charset=utf-8",
-		maxBytes: 1024 * 1024,
+		maxBytes: 512 * 1024,
+		maxDecodedBytes: 8 * 1024 * 1024,
 		json: true,
 	},
 };
@@ -198,6 +207,49 @@ async function verifyAndMarkHash(
 		);
 	}
 	return null;
+}
+
+// ============================================================================
+// gzip展開 (展開後サイズに上限を設ける)
+// 圧縮爆弾で Worker のメモリを食い潰されないよう、チャンクごとに積算して打ち切る
+// 上限超過またはgzipとして不正なら null
+// ============================================================================
+async function gunzipWithLimit(
+	buffer: ArrayBuffer,
+	limit: number,
+): Promise<Uint8Array | null> {
+	const stream = new Response(buffer).body?.pipeThrough(
+		new DecompressionStream("gzip"),
+	);
+	if (!stream) return null;
+
+	const reader = stream.getReader();
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			total += value.byteLength;
+			if (total > limit) {
+				await reader.cancel();
+				return null;
+			}
+			chunks.push(value);
+		}
+	} catch (e) {
+		// gzipとして壊れている
+		console.warn("Gunzip failed:", e);
+		return null;
+	}
+
+	const decoded = new Uint8Array(total);
+	let offset = 0;
+	for (const chunk of chunks) {
+		decoded.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return decoded;
 }
 
 const uploadedResponse = (link: string, key: string, deleteToken: string) =>
@@ -343,8 +395,11 @@ async function handleImageUpload(request: Request, env: Env): Promise<Response> 
 }
 
 // ============================================================================
-// テキストアップロード (POST /text?kind=mml|encrypt|mv|game)
+// テキストアップロード (POST /text?kind=mml|encrypt|mv|game[&gzip=1])
 // bodyはURLエンコードせずUTF-8の生テキストをそのまま送る
+// gzip=1 のときは gzip 圧縮したバイト列を送る。Workerは検証のため展開するが、
+// R2には圧縮されたまま保存し Content-Encoding: gzip を付ける。
+// こうすると読み出し側の fetch() をブラウザが透過的に展開してくれる。
 // ============================================================================
 async function handleTextUpload(
 	request: Request,
@@ -361,8 +416,9 @@ async function handleTextUpload(
 			400,
 		);
 	}
+	const gzipped = url.searchParams.get("gzip") === "1";
 
-	// --- サイズ検証 (デコード前にバイト長で弾く) ---
+	// --- 転送サイズ検証 (展開前のバイト長で弾く) ---
 	const buffer = await request.arrayBuffer();
 	if (buffer.byteLength === 0) {
 		return textResponse("Empty request body.", 400);
@@ -374,10 +430,23 @@ async function handleTextUpload(
 		);
 	}
 
+	// --- gzipなら展開 (展開後サイズも上限で打ち切る) ---
+	let decoded: ArrayBuffer | Uint8Array = buffer;
+	if (gzipped) {
+		const gunzipped = await gunzipWithLimit(buffer, config.maxDecodedBytes);
+		if (!gunzipped) {
+			return textResponse(
+				`Body is not valid gzip, or exceeds ${config.maxDecodedBytes / 1024}KB when decompressed.`,
+				400,
+			);
+		}
+		decoded = gunzipped;
+	}
+
 	// --- UTF-8として妥当か検証 ---
 	let text: string;
 	try {
-		text = new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+		text = new TextDecoder("utf-8", { fatal: true }).decode(decoded);
 	} catch {
 		return textResponse("Request body is not valid UTF-8.", 400);
 	}
@@ -398,16 +467,18 @@ async function handleTextUpload(
 	}
 
 	// --- リプレイ攻撃対策 (kindを含めて署名する) ---
+	// 署名対象は展開後のテキスト。gzipの有無で送信側のハッシュ計算が変わらない
 	const replayError = await verifyAndMarkHash(request, env, `${kind}\n${text}`);
 	if (replayError) return replayError;
 
-	// --- R2へ保存 ---
+	// --- R2へ保存 (gzipなら圧縮されたまま置く) ---
 	const id = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
 	const key = `${config.prefix}/${id}.${config.extension}`;
 	const deleteToken = await sha256(key + env.DELETE_SECRET_PEPPER);
-	await env.TEXT_BUCKET.put(key, text, {
+	await env.TEXT_BUCKET.put(key, gzipped ? buffer : text, {
 		httpMetadata: {
 			contentType: config.contentType,
+			contentEncoding: gzipped ? "gzip" : undefined,
 			cacheControl: "public, max-age=31536000, immutable",
 		},
 	});
