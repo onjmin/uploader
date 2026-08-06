@@ -62,11 +62,14 @@ interface TextKindConfig {
 
 const TEXT_KINDS: Record<string, TextKindConfig> = {
 	// 2048: MMLのデータ
+	// 中身は @onjmin/dtm の encodeMml 出力 (`z.` = gzip+base64url / `u.` = URLエンコード)。
+	// 生MMLは11トラックで45000文字を超えることがあり、`z.` なら1割弱まで縮むが、
+	// CompressionStream が無い環境の `u.` フォールバックは逆に膨らむので上限は広めに取る。
 	mml: {
 		prefix: "mml",
 		extension: "mml",
 		contentType: "text/plain; charset=utf-8",
-		maxBytes: 64 * 1024,
+		maxBytes: 256 * 1024,
 		json: false,
 	},
 	// 4096: 暗号レスのデータ

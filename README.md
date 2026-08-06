@@ -62,13 +62,20 @@
 
 | `kind` | content_type | キー | Content-Type | 上限 | 検証 |
 |---|---|---|---|---|---|
-| `mml` | 2048 | `mml/<16hex>.mml` | `text/plain; charset=utf-8` | 64KB | — |
+| `mml` | 2048 | `mml/<16hex>.mml` | `text/plain; charset=utf-8` | 256KB | — |
 | `encrypt` | 4096 | `encrypt/<16hex>.txt` | `text/plain; charset=utf-8` | 64KB | — |
 | `mv` | 8192 | `mv/<16hex>.json` | `application/json; charset=utf-8` | 512KB | `JSON.parse` |
 | `game` | 16384 | `game/<16hex>.json` | `application/json; charset=utf-8` | 1MB | `JSON.parse` |
 
 共通の検証: 空 body 拒否 / バイト長で上限判定 / UTF-8 として不正なら拒否 /
 制御文字（`\t` `\n` `\r` 以外）を含むなら拒否。
+
+**`mml` は生MMLではなく `encodeMml()` の出力を上げること。**
+生MMLは11トラックで45000文字（minify後39450文字）に達するが、`encodeMml` は
+gzip + base64url（`z.` 接頭辞）なので実際に送るのは数KBに収まる。
+`decodeMml(fetchしたテキスト)` が現状の `decodeMml(contentData)` とそのまま等価になる。
+上限 256KB は、`CompressionStream` が使えない環境の `u.`（`encodeURIComponent`）
+フォールバックで逆に膨らむケースを吸収するための余裕。
 
 ### レスポンス（POST 共通）
 
