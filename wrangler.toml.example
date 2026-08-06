@@ -3,6 +3,7 @@ main = "src/index.ts"
 compatibility_date = "2025-09-29"
 
 account_id = "" # 埋める
+preview_urls = false
 
 [vars]
 PUBLIC_URL_BASE = "" # 埋める (画像バケットの公開URL)

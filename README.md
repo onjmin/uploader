@@ -28,7 +28,7 @@
 ```json
 [
   {
-    "AllowedOrigins": ["https://<unjのオリジン>", "https://<unj-rezeのオリジン>"],
+    "AllowedOrigins": ["*"],
     "AllowedMethods": ["GET", "HEAD"],
     "AllowedHeaders": ["*"],
     "ExposeHeaders": ["Content-Encoding", "Content-Length"],
