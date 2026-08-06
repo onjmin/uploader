@@ -11,7 +11,7 @@
 | binding | バケット | 公開URL変数 | 中身 |
 |---|---|---|---|
 | `BUCKET` | 例 `unj-img` | `PUBLIC_URL_BASE` | 画像（`4` 画像URL / `1024` お絵描き） |
-| `TEXT_BUCKET` | 例 `unj-txt` | `PUBLIC_TEXT_URL_BASE` | テキスト（`2048` MML / `4096` 暗号レス / `8192` MV / `16384` ゲーム） |
+| `TEXT_BUCKET` | 例 `unj-text` | `PUBLIC_TEXT_URL_BASE` | テキスト（`2048` MML / `4096` 暗号レス / `8192` MV / `16384` ゲーム） |
 
 **バケットを分ける理由**
 
@@ -56,11 +56,21 @@
 - 上限 1MB、マジックバイトで jpeg / png / gif / webp のみ許可
 - `nsfwCheck=1` のとき Workers AI でモデレーション
 
-### POST `/text?kind=<kind>[&gzip=1]` — テキストアップロード（新規）
+### POST `/text?kind=<kind>&nonce=<nonce>[&gzip=1]` — テキストアップロード（新規）
 
 - body: **URLエンコードしない UTF-8 の生テキスト**
-- `X-Request-Hash` = `sha256(kind + "\n" + text + UPLOAD_SECRET_PEPPER)`
+- `nonce`: 毎回作り直す使い捨て文字列。`[0-9A-Za-z_-]{8,64}`（`crypto.randomUUID()` で可）
+- `X-Request-Hash` = `sha256(kind + "\n" + nonce + "\n" + text + UPLOAD_SECRET_PEPPER)`
   （`text` は**展開後**の文字列。gzip の有無でハッシュは変わらない）
+
+`nonce` が必須なのは、`ReplayProtector` が同一ハッシュを3日間ブロックするため。
+これが無いと **本文がバイト単位で一致する正当な投稿が 403 になる**:
+
+- 編集して元に戻して保存（本文が完全一致）
+- プリセットから作ったゲーム／MVを無編集で投稿したユーザーが3日以内に2人
+- 同じMMLをコピペした2人目
+
+`nonce` 自体を署名に含めているので、リクエストまるごとの使い回しは従来どおり弾かれる。
 
 | `kind` | content_type | キー | Content-Type | 転送上限 | 展開後上限 | 検証 |
 |---|---|---|---|---|---|---|
@@ -129,9 +139,12 @@ const uploadText = async (
 ) => {
   // mv/game は圧縮が桁で効く。mml/encrypt は圧縮済みなので素で送る
   const useGzip = kind === "mv" || kind === "game";
-  const requestHash = await sha256(`${kind}\n${text}` + UPLOAD_SECRET_PEPPER);
+  const nonce = crypto.randomUUID().replace(/-/g, "");
+  const requestHash = await sha256(
+    `${kind}\n${nonce}\n${text}` + UPLOAD_SECRET_PEPPER,
+  );
   const res = await fetch(
-    `${CLOUDFLARE_URL}/text?kind=${kind}${useGzip ? "&gzip=1" : ""}`,
+    `${CLOUDFLARE_URL}/text?kind=${kind}&nonce=${nonce}${useGzip ? "&gzip=1" : ""}`,
     {
       method: "POST",
       headers: {
@@ -154,6 +167,30 @@ gzip で置いたものも、ブラウザが `Content-Encoding` を見て自動�
 const manifest = await fetch(contentData).then((r) => r.json()); // mv / game
 const mml = await fetch(contentData).then((r) => r.text());      // mml / encrypt
 ```
+
+## 編集（MML / MV / ゲーム）
+
+オブジェクトは不変。**同じキーへの上書きは禁止**（`immutable` で配っているので、
+エッジとブラウザが最大1年間ずっと古い内容を返す）。編集は毎回新しいキーに上げ直す。
+
+**順序を守ること。`delete` を先にやってはいけない。**
+
+```
+1. POST /text        → 新しい link / delete_id / delete_hash を得る
+2. DBを新しいURLで更新
+3. 旧オブジェクトを DELETE /delete
+```
+
+- 逆順にすると、2 が失敗した時点で投稿が復旧不能になる（DBは旧URLを指したまま実体が無い）。
+  この順なら最悪でも孤児オブジェクトが1個残るだけで、表示は壊れない。
+- **3 は即時にしないほうがよい。** 直前にレス一覧を取得したクライアントはまだ旧URLを
+  持っているので、即消すと 404 になる。数分遅延させるか、孤児をまとめて後で刈る。
+- 孤児の刈り取りは**アプリ側の責任**。uploader は DB を持たないので、
+  どのキーが生きているかを判定できない。
+
+`delete_hash` = `sha256(delete_id + DELETE_SECRET_PEPPER)` で、`DELETE_SECRET_PEPPER` は
+Worker 側にしか無い。**アップロード時のレスポンスに入っている `delete_hash` を
+DBに保存しておかないと、後から消せなくなる。**
 
 ## セットアップ
 

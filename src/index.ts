@@ -116,6 +116,11 @@ const TEXT_KEY_PATTERN = new RegExp(
 // 画像キー: `<8桁hex>.<ext>` (ディレクトリを持たない従来形式)
 const IMAGE_KEY_PATTERN = /^[0-9a-f]{8}\.[a-z]{2,4}$/;
 
+// 使い捨てのnonce (base64url想定)
+// 本文が完全一致してもハッシュが衝突しないようにするためのもの。
+// プリセット由来のmanifestや、編集を元に戻した再保存は本文が一致しうる
+const NONCE_PATTERN = /^[0-9A-Za-z_-]{8,64}$/;
+
 const CORS_HEADERS = {
 	"Access-Control-Allow-Origin": "*",
 };
@@ -395,7 +400,7 @@ async function handleImageUpload(request: Request, env: Env): Promise<Response> 
 }
 
 // ============================================================================
-// テキストアップロード (POST /text?kind=mml|encrypt|mv|game[&gzip=1])
+// テキストアップロード (POST /text?kind=mml|encrypt|mv|game&nonce=xxx[&gzip=1])
 // bodyはURLエンコードせずUTF-8の生テキストをそのまま送る
 // gzip=1 のときは gzip 圧縮したバイト列を送る。Workerは検証のため展開するが、
 // R2には圧縮されたまま保存し Content-Encoding: gzip を付ける。
@@ -417,6 +422,17 @@ async function handleTextUpload(
 		);
 	}
 	const gzipped = url.searchParams.get("gzip") === "1";
+
+	// --- nonce ---
+	// 同じ本文を上げ直しても403にならないようにする。
+	// nonce自体は署名に含むので、リクエストまるごとの使い回しは従来どおり弾かれる
+	const nonce = url.searchParams.get("nonce") ?? "";
+	if (!NONCE_PATTERN.test(nonce)) {
+		return textResponse(
+			"Missing or malformed 'nonce' parameter (8-64 chars of [0-9A-Za-z_-]).",
+			400,
+		);
+	}
 
 	// --- 転送サイズ検証 (展開前のバイト長で弾く) ---
 	const buffer = await request.arrayBuffer();
@@ -466,9 +482,13 @@ async function handleTextUpload(
 		}
 	}
 
-	// --- リプレイ攻撃対策 (kindを含めて署名する) ---
+	// --- リプレイ攻撃対策 (kindとnonceを含めて署名する) ---
 	// 署名対象は展開後のテキスト。gzipの有無で送信側のハッシュ計算が変わらない
-	const replayError = await verifyAndMarkHash(request, env, `${kind}\n${text}`);
+	const replayError = await verifyAndMarkHash(
+		request,
+		env,
+		`${kind}\n${nonce}\n${text}`,
+	);
 	if (replayError) return replayError;
 
 	// --- R2へ保存 (gzipなら圧縮されたまま置く) ---
