@@ -1,0 +1,30 @@
+{
+	"compilerOptions": {
+		"module": "esnext", // または commonjs
+		"target": "es2020",
+		"moduleResolution": "node", // ES Moduleを使うなら "node" または "nodeNext"
+
+		// ↓↓↓ このセクションが重要です ↓↓↓
+		"types": [
+			"@cloudflare/workers-types" // Workersのグローバル型を認識させる
+		],
+		"paths": {
+			// TypeScriptに 'cloudflare:workers' の型解決方法を教える
+			"cloudflare:workers": [
+				"./node_modules/@cloudflare/workers-types/experimental"
+			]
+		},
+		"lib": [
+			"es2020",
+			"webworker" // Web Workerの環境型を有効にする
+		],
+		// ↑↑↑ このセクションが重要です ↑↑↑
+		"rootDir": "src",
+		"outDir": "dist",
+		"allowSyntheticDefaultImports": true,
+		"forceConsistentCasingInFileNames": true,
+		"strict": true,
+		"skipLibCheck": true
+	},
+	"include": ["src/**/*"]
+}

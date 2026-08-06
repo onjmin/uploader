@@ -1,0 +1,28 @@
+name = "uploader-worker"
+main = "src/index.ts"
+compatibility_date = "2025-09-29" 
+
+account_id = "" # 埋める
+
+[vars]
+PUBLIC_URL_BASE = "" # 埋める
+CLIENT_ID = "" # 埋める
+UPLOAD_SECRET_PEPPER = "" # 埋める
+DELETE_SECRET_PEPPER = "" # 埋める
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "" # 埋める
+
+[durable_objects]
+bindings = [
+    { name = "RATE_LIMITER", class_name = "RateLimiter" },
+    { name = "REPLAY_PROTECTOR", class_name = "ReplayProtector" },
+]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = [ "RateLimiter", "ReplayProtector" ]
+
+[ai]
+binding = "AI"
