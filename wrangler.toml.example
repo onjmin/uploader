@@ -1,18 +1,23 @@
 name = "uploader-worker"
 main = "src/index.ts"
-compatibility_date = "2025-09-29" 
+compatibility_date = "2025-09-29"
 
 account_id = "" # 埋める
 
 [vars]
-PUBLIC_URL_BASE = "" # 埋める
+PUBLIC_URL_BASE = "" # 埋める (画像バケットの公開URL)
+PUBLIC_TEXT_URL_BASE = "" # 埋める (テキストバケットの公開URL)
 CLIENT_ID = "" # 埋める
 UPLOAD_SECRET_PEPPER = "" # 埋める
 DELETE_SECRET_PEPPER = "" # 埋める
 
 [[r2_buckets]]
 binding = "BUCKET"
-bucket_name = "" # 埋める
+bucket_name = "" # 埋める (画像用)
+
+[[r2_buckets]]
+binding = "TEXT_BUCKET"
+bucket_name = "" # 埋める (テキスト用)
 
 [durable_objects]
 bindings = [
