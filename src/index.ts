@@ -105,7 +105,9 @@ const TEXT_KINDS: Record<string, TextKindConfig> = {
 		maxDecodedBytes: 8 * 1024 * 1024,
 		json: true,
 	},
-	// 32768: かけあい動画（talk）のデータ。台本と参照だけなので MV より小さい
+	// かけあい動画（talk）のデータ。台本と参照だけなので MV より小さい。
+	// 投稿側は content_type ではなく threads/res.talk_id（外部キー）で紐づくので、
+	// content_type のビットは割り当てない（SMALLINT の 32768 は入らない）。
 	talk: {
 		prefix: "talk",
 		extension: "json",
