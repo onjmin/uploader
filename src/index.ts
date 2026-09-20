@@ -105,6 +105,15 @@ const TEXT_KINDS: Record<string, TextKindConfig> = {
 		maxDecodedBytes: 8 * 1024 * 1024,
 		json: true,
 	},
+	// 32768: かけあい動画（talk）のデータ。台本と参照だけなので MV より小さい
+	talk: {
+		prefix: "talk",
+		extension: "json",
+		contentType: "application/json; charset=utf-8",
+		maxBytes: 512 * 1024,
+		maxDecodedBytes: 2 * 1024 * 1024,
+		json: true,
+	},
 };
 
 // テキストキー: `<prefix>/<16桁hex>.<ext>`
@@ -400,7 +409,7 @@ async function handleImageUpload(request: Request, env: Env): Promise<Response> 
 }
 
 // ============================================================================
-// テキストアップロード (POST /text?kind=mml|encrypt|mv|game&nonce=xxx[&gzip=1])
+// テキストアップロード (POST /text?kind=mml|encrypt|mv|game|talk&nonce=xxx[&gzip=1])
 // bodyはURLエンコードせずUTF-8の生テキストをそのまま送る
 // gzip=1 のときは gzip 圧縮したバイト列を送る。Workerは検証のため展開するが、
 // R2には圧縮されたまま保存し Content-Encoding: gzip を付ける。
