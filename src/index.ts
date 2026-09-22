@@ -39,6 +39,9 @@ interface Env {
 
 // 許可される最大ファイルサイズ (1MB)
 const MAX_FILE_SIZE = 1 * 1024 * 1024;
+// POST /image（バイナリ直送）の上限。お絵描きの 1600x1200 PNG が実測 2.8MB あるので
+// 1MB では足りない。base64 デコードをしない経路なので大きくしても CPU はほぼ増えない
+const MAX_RAW_IMAGE_SIZE = 4 * 1024 * 1024;
 // 許可されるファイル形式
 const ALLOWED_MIME_TYPES = [
 	"image/jpeg",
@@ -148,8 +151,13 @@ const textResponse = (body: string, status: number) =>
 // Cloudflare Workers では SubtleCrypto が利用可能
 // ============================================================================
 async function sha256(message: string): Promise<string> {
-	const msgUint8 = new TextEncoder().encode(message);
-	const hashBuffer = await crypto.subtle.digest("SHA-256", msgUint8);
+	return sha256Bytes(new TextEncoder().encode(message));
+}
+
+async function sha256Bytes(
+	data: ArrayBuffer | Uint8Array<ArrayBuffer>,
+): Promise<string> {
+	const hashBuffer = await crypto.subtle.digest("SHA-256", data);
 	const hashArray = Array.from(new Uint8Array(hashBuffer));
 	// バイト列を16進文字列に変換
 	return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
@@ -320,6 +328,63 @@ async function handleImageUpload(request: Request, env: Env): Promise<Response> 
 		return textResponse("Invalid image data format.", 400);
 	}
 
+	return storeImage(env, imageBuffer, nsfwCheck === "1");
+}
+
+// ============================================================================
+// 画像アップロード (POST /image?nonce=xxx[&nsfwCheck=1])
+// bodyは画像のバイト列そのもの。base64 で送る従来の POST / と比べて
+// 転送量が3割減り、Worker 側の atob/1文字ずつのコピーも無くなる（CPU 10ms 枠対策）。
+//
+// 署名は `image\n${nonce}\n${本体のSHA-256}` + PEPPER。
+// nonce を含めるので、同じ画像を上げ直しても（投稿失敗からの再送、同じアイコンの付け直し）
+// リプレイ検知で 403 にならない。nonce自体が署名対象なのでリクエストの使い回しは弾かれる。
+// ============================================================================
+async function handleRawImageUpload(
+	request: Request,
+	env: Env,
+	url: URL,
+): Promise<Response> {
+	const nonce = url.searchParams.get("nonce") ?? "";
+	if (!NONCE_PATTERN.test(nonce)) {
+		return textResponse(
+			"Missing or malformed 'nonce' parameter (8-64 chars of [0-9A-Za-z_-]).",
+			400,
+		);
+	}
+
+	const buffer = await request.arrayBuffer();
+	if (buffer.byteLength === 0) {
+		return textResponse("Empty request body.", 400);
+	}
+	if (buffer.byteLength > MAX_RAW_IMAGE_SIZE) {
+		return textResponse(
+			`File size must be less than ${MAX_RAW_IMAGE_SIZE / 1024 / 1024}MB.`,
+			413,
+		);
+	}
+
+	const bodyDigest = await sha256Bytes(buffer);
+	const replayError = await verifyAndMarkHash(
+		request,
+		env,
+		`image\n${nonce}\n${bodyDigest}`,
+	);
+	if (replayError) return replayError;
+
+	return storeImage(
+		env,
+		new Uint8Array(buffer),
+		url.searchParams.get("nsfwCheck") === "1",
+	);
+}
+
+// マジックバイト判定 → (任意)AIモデレーション → R2保存。キーは必ずサーバーで作る
+async function storeImage(
+	env: Env,
+	imageBuffer: Uint8Array,
+	nsfwCheck: boolean,
+): Promise<Response> {
 	// --- MIMEタイプ判定 (マジックバイト) ---
 	let mimeType = "application/octet-stream";
 	let fileExtension = "dat";
@@ -362,7 +427,7 @@ async function handleImageUpload(request: Request, env: Env): Promise<Response> 
 	}
 
 	// --- AIによる画像モデレーション ---
-	if (nsfwCheck === "1") {
+	if (nsfwCheck) {
 		const IMAGE_TO_TEXT_MODEL = "@cf/unum/uform-gen2-qwen-500m";
 		const BANNED_KEYWORDS = [
 			"feces",
@@ -573,9 +638,10 @@ export default {
 			if (limitError) return limitError;
 
 			try {
-				return path === "/text"
-					? await handleTextUpload(request, env, url)
-					: await handleImageUpload(request, env);
+				if (path === "/text") return await handleTextUpload(request, env, url);
+				if (path === "/image")
+					return await handleRawImageUpload(request, env, url);
+				return await handleImageUpload(request, env);
 			} catch (e) {
 				console.error("Upload Error:", e);
 				return textResponse(
