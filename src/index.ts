@@ -119,6 +119,16 @@ const TEXT_KINDS: Record<string, TextKindConfig> = {
 		maxDecodedBytes: 2 * 1024 * 1024,
 		json: true,
 	},
+	// 音MAD（otomad）のデータ。曲（MML）と素材の参照・配置だけ。talk と同じ扱い。
+	// 投稿側は threads/res.otomad_id（外部キー）で紐づくので content_type のビットは割り当てない。
+	otomad: {
+		prefix: "otomad",
+		extension: "json",
+		contentType: "application/json; charset=utf-8",
+		maxBytes: 512 * 1024,
+		maxDecodedBytes: 2 * 1024 * 1024,
+		json: true,
+	},
 };
 
 // テキストキー: `<prefix>/<16桁hex>.<ext>`
@@ -476,7 +486,7 @@ async function storeImage(
 }
 
 // ============================================================================
-// テキストアップロード (POST /text?kind=mml|encrypt|mv|game|talk&nonce=xxx[&gzip=1])
+// テキストアップロード (POST /text?kind=mml|encrypt|mv|game|talk|otomad&nonce=xxx[&gzip=1])
 // bodyはURLエンコードせずUTF-8の生テキストをそのまま送る
 // gzip=1 のときは gzip 圧縮したバイト列を送る。Workerは検証のため展開するが、
 // R2には圧縮されたまま保存し Content-Encoding: gzip を付ける。
