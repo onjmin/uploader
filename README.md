@@ -46,7 +46,52 @@
 | `Authorization` | `Client-ID <CLIENT_ID>` |
 | `X-Request-Hash` | 後述の SHA-256 |
 
-いずれも IP 単位のレート制限（10秒 3回）とリプレイ検知（同一ハッシュ 3日間ブロック）を通る。
+いずれも後述のレート制限とリプレイ検知（同一ハッシュ 3日間ブロック）を通る。
+
+### レート制限・容量の上限
+
+POST はすべて、本文を読む前に次の3段の上限を確かめる。
+
+| 段 | 単位 | 既定の上限 | 上書き用の `[vars]` |
+|---|---|---|---|
+| クライアント | IPv4 アドレス / IPv6 の **/64** | 10秒 3回・1時間 120回・1日 600回・1日 64MB | `RATE_LIMIT_PER_HOUR` / `RATE_LIMIT_PER_DAY` / `PER_CLIENT_DAILY_BYTES` |
+| ネットワーク | IPv6 の **/48** | クライアントの上限の16倍（10秒の上限は無し） | `PREFIX48_FACTOR`（倍率） |
+| 全体 | 全クライアント合計 | 1日 32GB・1日 30万回 | `GLOBAL_DAILY_BYTES` / `GLOBAL_DAILY_UPLOADS` |
+
+- **10秒の回数**はクライアントの試行ごとに数える（成否に関係なく連打を抑える）。
+- **1時間・1日の回数とバイト数**は、R2 への保存に成功したアップロードだけを数える。
+  本文を読む前に「今日の成功ぶん＋`Content-Length`」が上限内かを確かめ（`Content-Length` が無い chunked では
+  その経路の上限いっぱいで確かめる）、保存に成功したら受け取った本文のバイト数を足す。
+  ハッシュ不一致・途中の切断・サイズを宣言しただけのリクエストは枠を消費しないので、
+  空打ちで全体や /48、同じ IP を共有する人（CGNAT など）の枠を埋めることはできない。
+  同時に流れているリクエストのぶん上限を少し超えうるが、クライアントごとの同時数は10秒3回で抑えてある。
+- バイト数は本文のサイズで数える。POST `/` は base64 のぶん画像より約1.33倍に数える。
+- 1時間は毎正時、1日は**日本時間0時**で区切る固定窓。
+- 超えたら `429`。本文に理由（10秒 / 1時間 / 1日の回数 / 1日のバイト数 / ネットワーク / 全体）、
+  `Retry-After` に次に通る見込みまでの秒数が入る（`Access-Control-Expose-Headers` で読める）。
+- `[vars]` は任意。書かない・数値として読めない・0以下のときは既定値（`src/index.ts` の `DEFAULT_LIMITS`）。
+- 既定値は、どちらのクライアントもユーザー操作1回につき1〜2回しか上げない（自動保存は IndexedDB で、
+  uploader は叩かない）ことから、重い制作者の数倍、連打スクリプトの桁下に置いてある。根拠は `src/index.ts` のコメント。
+- /48 は1契約とは限らない（NGN の IPoE や携帯は共有の /48 から /56・/64 を配る）ので、
+  /64 を取り替えての回避を止める粗い歯止めとして重い制作者16人ぶんを置いている。
+- 全体の上限は R2 の容量と Class A 操作が際限なく増えるのを止める最後の歯止め。
+  使い切るとその日は全員がアップロードできなくなるので、1つのネットワークでは届かない大きさ
+  （バイト数は IPv4 512個・/48 32個ぶん、回数は IPv4 500個・/48 約31個ぶん）にしてある。
+  下げるときもこの比（全体 ÷ (クライアント × `PREFIX48_FACTOR`) が 32 前後）を保つこと。
+  ログに `Global daily quota reached` や `Prefix limit` が出ていないか見ること。
+- `CF-Connecting-IP` で数える。ゾーンの Pseudo IPv4 が「ヘッダーを上書き」で、
+  `CF-Connecting-IP` がクラス E（240.0.0.0/4）の疑似アドレスのときだけ `CF-Connecting-IPv6` で数える。
+- 数えるのは既存の `RateLimiter` Durable Object（全体は `idFromName("__global__")`）なので、migration の追加は要らない。
+  デプロイの切り替わり中に旧 Worker から来る `checkLimit` にも、従来どおり10秒3回で答える。
+
+本文のサイズは、読む前に `Content-Length` で確かめて超えていれば `413` を返す。
+`Content-Length` が無いときも、読みながら積算して上限を超えた時点で打ち切る。
+
+| 経路 | 本文の上限 |
+|---|---|
+| POST `/` | 1MB の base64 にフォームの分を見込んだ約 2MB（デコード後 1MB は base64 の長さから判定） |
+| POST `/image` | 4MB |
+| POST `/text` | `kind` ごとの転送上限（下表） |
 
 ### POST `/` — 画像アップロード（従来どおり）
 
@@ -55,6 +100,12 @@
 - `X-Request-Hash` = `sha256(base64 + UPLOAD_SECRET_PEPPER)`
 - 上限 1MB、マジックバイトで jpeg / png / gif / webp のみ許可
 - `nsfwCheck=1` のとき Workers AI でモデレーション
+
+### POST `/image?nonce=<nonce>[&nsfwCheck=1]` — 画像アップロード（バイナリ直送）
+
+- body: 画像のバイト列そのもの（base64 にしない）
+- `X-Request-Hash` = `sha256("image" + "\n" + nonce + "\n" + sha256(本体) + UPLOAD_SECRET_PEPPER)`
+- 上限 4MB。形式チェックとモデレーションは POST `/` と同じ
 
 ### POST `/text?kind=<kind>&nonce=<nonce>[&gzip=1]` — テキストアップロード（新規）
 
@@ -116,6 +167,7 @@ gzip + base64url（`z.` 接頭辞）なので実際に送るのは数KBに収ま
 ### DELETE `/delete?delete_id=&delete_hash=`
 
 `delete_hash` = `sha256(delete_id + DELETE_SECRET_PEPPER)`。
+`delete_hash` と `X-Request-Hash` の照合は定数時間で比べる（`crypto.subtle.timingSafeEqual`）。
 
 `delete_id` の形からバケットを振り分ける。
 テキストは `<kind>/<16hex>.<ext>`、画像は `<8hex>.<ext>` でディレクトリを持たないので衝突しない。

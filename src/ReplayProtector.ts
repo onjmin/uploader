@@ -8,6 +8,14 @@ const CLEANUP_INTERVAL = HASH_TTL;
 // KVのキーに付与するプレフィックス
 const HASH_PREFIX = "hash:";
 
+// クリーンアップのページング
+const LIST_PAGE_SIZE = 1000; // list() 1回で読む件数
+const DELETE_BATCH_SIZE = 128; // storage.delete() に一度に渡せるキーの上限
+const MAX_PAGES_PER_ALARM = 50; // 1回のアラームで読むページ数の上限
+const CONTINUE_DELAY = 30 * 1000; // 読み切れなかったときに続きを始めるまでの間隔
+// 読み切れなかったときの続きの位置（HASH_PREFIX の外に置き、list の対象にしない）
+const CURSOR_KEY = "cleanup:cursor";
+
 export class ReplayProtector {
 	state: DurableObjectState;
 	// クリーンアップタスクのタイマーID (Alarm用)
@@ -91,30 +99,50 @@ export class ReplayProtector {
 		console.log("ReplayProtector Alarm triggered. Starting cleanup...");
 
 		const now = Date.now();
-		const keysToDelete: string[] = [];
+		let deleted = 0;
 
-		// HASH_PREFIX で始まるすべてのキーとその値 (有効期限のタイムスタンプ) を取得
-		// list() の limit を設定しないことで、全件取得を試みる
-		const allHashes = await this.state.storage.list<number>({
-			prefix: HASH_PREFIX,
-		});
+		// HASH_PREFIX のキーを LIST_PAGE_SIZE 件ずつ読み、期限切れを消していく。
+		// 全件を一度に list() すると件数に比例してメモリを食うので、ページ単位で回す。
+		// 1回のアラームで読むのは MAX_PAGES_PER_ALARM ページまで。読み切れなければ
+		// 続きの位置を CURSOR_KEY に残し、少し後に続きから再開する
+		let cursor = await this.state.storage.get<string>(CURSOR_KEY);
+		let finished = false;
+		for (let page = 0; page < MAX_PAGES_PER_ALARM; page++) {
+			const entries = await this.state.storage.list<number>({
+				prefix: HASH_PREFIX,
+				limit: LIST_PAGE_SIZE,
+				...(cursor ? { startAfter: cursor } : {}),
+			});
 
-		for (const [key, expiryTime] of allHashes.entries()) {
-			// 現在時刻が有効期限を過ぎていたら削除対象に追加
-			if (expiryTime <= now) {
-				keysToDelete.push(key);
+			const expired: string[] = [];
+			for (const [key, expiryTime] of entries) {
+				// 現在時刻が有効期限を過ぎていたら削除対象に追加
+				if (expiryTime <= now) expired.push(key);
+				cursor = key;
+			}
+			// delete() は1回あたり128キーまで
+			for (let i = 0; i < expired.length; i += DELETE_BATCH_SIZE) {
+				deleted += await this.state.storage.delete(
+					expired.slice(i, i + DELETE_BATCH_SIZE),
+				);
+			}
+
+			if (entries.size < LIST_PAGE_SIZE) {
+				finished = true;
+				break;
 			}
 		}
+		console.log(`Cleaned up ${deleted} expired hashes.`);
 
-		if (keysToDelete.length > 0) {
-			await this.state.storage.delete(keysToDelete);
-			console.log(`Cleaned up ${keysToDelete.length} expired hashes.`);
+		if (finished) {
+			await this.state.storage.delete(CURSOR_KEY);
+			// 次のクリーンアップを HASH_TTL (3日) 後に再設定
+			await this.state.storage.setAlarm(now + CLEANUP_INTERVAL);
+			console.log("Next cleanup scheduled.");
 		} else {
-			console.log("No expired hashes found to clean up.");
+			if (cursor) await this.state.storage.put(CURSOR_KEY, cursor);
+			await this.state.storage.setAlarm(now + CONTINUE_DELAY);
+			console.log("Cleanup will continue shortly.");
 		}
-
-		// 次のクリーンアップを HASH_TTL (3日) 後に再設定
-		await this.state.storage.setAlarm(now + CLEANUP_INTERVAL);
-		console.log("Next cleanup scheduled.");
 	}
 }

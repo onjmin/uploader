@@ -5,7 +5,13 @@ import type {
 	R2Bucket,
 } from "@cloudflare/workers-types";
 
-import { RateLimiter } from "./RateLimiter";
+import {
+	type AdmitRequest,
+	type CommitRequest,
+	type LimitReason,
+	type LimitResult,
+	RateLimiter,
+} from "./RateLimiter";
 export { RateLimiter };
 
 import { ReplayProtector } from "./ReplayProtector";
@@ -14,11 +20,6 @@ export { ReplayProtector };
 // ============================================================================
 // 1. 環境変数の型定義
 // ============================================================================
-interface RateLimitResult {
-	allowed: boolean;
-	remaining: number;
-}
-
 interface ReplayCheckResult {
 	allowed: boolean;
 	message: string;
@@ -35,13 +36,103 @@ interface Env {
 	RATE_LIMITER: DurableObjectNamespace; // アップロード回数制限 (荒らし対策)
 	REPLAY_PROTECTOR: DurableObjectNamespace; // リプレイ攻撃対策 (同じリクエストの使い回し防止)
 	AI: Ai;
+	// 以下は任意。未設定・不正値なら DEFAULT_LIMITS を使う（[vars] に書けば上書きできる）
+	RATE_LIMIT_PER_HOUR?: string | number; // クライアント1つあたり1時間の回数
+	RATE_LIMIT_PER_DAY?: string | number; // クライアント1つあたり1日の回数
+	PER_CLIENT_DAILY_BYTES?: string | number; // クライアント1つあたり1日のバイト数
+	PREFIX48_FACTOR?: string | number; // IPv6 /48 の上限 = クライアントの上限 × この値
+	GLOBAL_DAILY_BYTES?: string | number; // 全体で1日のバイト数
+	GLOBAL_DAILY_UPLOADS?: string | number; // 全体で1日の回数
 }
 
 // 許可される最大ファイルサイズ (1MB)
 const MAX_FILE_SIZE = 1 * 1024 * 1024;
+// POST /（base64 のフォーム）の本文の上限。base64 で 4/3 倍になり、さらに
+// URLSearchParams が `+` `/` を %2B %2F（3文字）にする。`+` `/` は64文字中2文字なので
+// 実際の増え方は1割未満だが、余裕を見て 1.5 倍＋フォームの他の項目ぶりを許す
+const MAX_FORM_BODY_SIZE =
+	Math.ceil(Math.ceil(MAX_FILE_SIZE / 3) * 4 * 1.5) + 1024;
 // POST /image（バイナリ直送）の上限。お絵描きの 1600x1200 PNG が実測 2.8MB あるので
 // 1MB では足りない。base64 デコードをしない経路なので大きくしても CPU はほぼ増えない
 const MAX_RAW_IMAGE_SIZE = 4 * 1024 * 1024;
+
+// ============================================================================
+// アップロードの上限（回数・バイト数）
+//
+// 数え方: 10秒の回数（burst）は試行ごとに、それ以外（1時間・1日の回数とバイト数）は
+// R2 への保存に成功したアップロードだけを数える（RateLimiter.ts の admit / commit）。
+// 本文を読む前に「今日の成功ぶん＋宣言サイズ」が上限内かを確かめ、保存に成功したら
+// 受け取ったバイト数を足す。失敗・切断・サイズを宣言しただけのリクエストは枠を消費しない。
+//
+// 既定値の根拠（2026-10 時点のクライアントを grep して決めた）:
+// - unj: 投稿1回につき画像1枚（POST /）と、DTM・暗号レスなら本文1つ（/text）。
+// - unj-reze: 画像（POST /image）は投稿・お絵描き/ドット絵の保存・素材シートへの
+//   画像追加・プロフィール画像のたびに1回。ゲーム/MV/かけあい/音MADは保存のたびに
+//   manifest 1つ、MML は投稿ごとに1つ（/text）。お絵描きの自動保存は IndexedDB で、
+//   uploader は叩かない。
+// どれもユーザー操作1回につき1〜2回なので、素材を次々に取り込む重い制作者でも
+// 1時間に数十回、1日に数百回ほど。上限はその数倍に置き、スクリプトの連打
+// （10秒3回の上限いっぱいで1時間1080回・1日2.6万回）よりは桁で小さくする。
+// - バイト数はクライアント1つで1日 64MB。最大級のお絵描き（実測 2.8MB）なら20枚あまり、
+//   unj の上限いっぱいの画像（POST / の本文は base64 で約1.4MB）なら40枚あまり。
+//   ふつうの画像はずっと小さい。バイト数は本文のサイズで数える（POST / は画像より約1.33倍）。
+// - IPv6 の /48 はクライアントの16倍（PREFIX48_FACTOR）。/48 を持てば /64 を6万通り以上
+//   取り替えられるので、その抜け道を塞ぐ粗い歯止め。日本では /48 が1契約とは限らない
+//   （NGN の IPoE は /48 を分けて /56・/64 を配り、携帯は共有の /48 から /64 を配る）ので、
+//   重い制作者16人ぶんを置き、成功したアップロードしか数えないので空打ちでは埋まらない。
+// - 全体は1日 32GB・30万回。1つのネットワークでは使い切れない大きさにする
+//   （バイト数は IPv4 512個・/48 32個ぶん、回数は IPv4 500個・/48 約31個ぶん）。
+//   使い切ると日本時間0時まで全員が上げられなくなるので、正当な利用より桁で大きく置き、
+//   R2 の容量と Class A 操作が際限なく増えるのを止める最後の歯止めとして使う。
+// ============================================================================
+const BURST_LIMIT = 3; // 10秒あたりの回数（従来どおり）
+const DEFAULT_LIMITS = {
+	perHour: 120,
+	perDay: 600,
+	perClientDailyBytes: 64 * 1024 * 1024,
+	prefix48Factor: 16,
+	globalDailyBytes: 32 * 1024 * 1024 * 1024,
+	globalDailyUploads: 300000,
+};
+// 全体の上限を数える RateLimiter の名前（クライアントの名前は `ip4:` などで始まるので衝突しない）
+const GLOBAL_LIMITER_NAME = "__global__";
+
+interface UploadLimits {
+	perHour: number;
+	perDay: number;
+	perClientDailyBytes: number;
+	prefix48Factor: number;
+	globalDailyBytes: number;
+	globalDailyUploads: number;
+}
+
+// [vars] の値を正の整数として読む。未設定・不正値は既定値
+const readLimit = (value: string | number | undefined, fallback: number) => {
+	if (value === undefined || value === null || value === "") return fallback;
+	const n = typeof value === "number" ? value : Number(String(value).trim());
+	return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+};
+
+const readLimits = (env: Env): UploadLimits => ({
+	perHour: readLimit(env.RATE_LIMIT_PER_HOUR, DEFAULT_LIMITS.perHour),
+	perDay: readLimit(env.RATE_LIMIT_PER_DAY, DEFAULT_LIMITS.perDay),
+	perClientDailyBytes: readLimit(
+		env.PER_CLIENT_DAILY_BYTES,
+		DEFAULT_LIMITS.perClientDailyBytes,
+	),
+	prefix48Factor: readLimit(
+		env.PREFIX48_FACTOR,
+		DEFAULT_LIMITS.prefix48Factor,
+	),
+	globalDailyBytes: readLimit(
+		env.GLOBAL_DAILY_BYTES,
+		DEFAULT_LIMITS.globalDailyBytes,
+	),
+	globalDailyUploads: readLimit(
+		env.GLOBAL_DAILY_UPLOADS,
+		DEFAULT_LIMITS.globalDailyUploads,
+	),
+});
 // 許可されるファイル形式
 const ALLOWED_MIME_TYPES = [
 	"image/jpeg",
@@ -174,32 +265,321 @@ async function sha256Bytes(
 }
 
 // ============================================================================
-// レート制限 (IP単位でDOによる制御)
+// 定数時間の文字列比較 (削除トークン・リクエストハッシュ用)
+// 比べるのは固定長の16進なので、長さが違えばその場で false でよい
 // ============================================================================
+function safeEqual(a: string, b: string): boolean {
+	const encoder = new TextEncoder();
+	const x = encoder.encode(a);
+	const y = encoder.encode(b);
+	if (x.byteLength !== y.byteLength) return false;
+	// Workers の SubtleCrypto には非標準の timingSafeEqual がある。無い環境では XOR で比べる
+	const subtle = crypto.subtle as SubtleCrypto & {
+		timingSafeEqual?: (a: ArrayBufferView, b: ArrayBufferView) => boolean;
+	};
+	if (typeof subtle.timingSafeEqual === "function") {
+		return subtle.timingSafeEqual(x, y);
+	}
+	let diff = 0;
+	for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
+	return diff === 0;
+}
+
+// ============================================================================
+// レート制限のキー
+// IPv4 はアドレスそのもの、IPv6 は /64（1回線に割り当てられる単位）で数える。
+// IPv6 のアドレスを1つずつ数えると、/64 の中でアドレスを替えるだけで素通りできる。
+// CF-Connecting-IP は Cloudflare が付け直すので、クライアントは偽れない
+// ============================================================================
+function parseIPv4(s: string): number[] | null {
+	const parts = s.split(".");
+	if (parts.length !== 4) return null;
+	const out: number[] = [];
+	for (const p of parts) {
+		if (!/^\d{1,3}$/.test(p)) return null;
+		const n = Number(p);
+		if (n > 255) return null;
+		out.push(n);
+	}
+	return out;
+}
+
+// 省略形（`::`）や末尾のIPv4表記（`::ffff:1.2.3.4`）を展開して16bit×8個にする
+function parseIPv6(s: string): number[] | null {
+	let str = s.trim();
+	if (str.startsWith("[") && str.endsWith("]")) str = str.slice(1, -1);
+	const zone = str.indexOf("%");
+	if (zone >= 0) str = str.slice(0, zone);
+
+	// 末尾のIPv4表記は 0:0 に置き換えて展開し、あとで2ブロックに差し替える
+	let v4Tail: number[] | null = null;
+	const lastColon = str.lastIndexOf(":");
+	if (lastColon < 0) return null;
+	if (str.slice(lastColon + 1).includes(".")) {
+		const v4 = parseIPv4(str.slice(lastColon + 1));
+		if (!v4) return null;
+		v4Tail = [(v4[0] << 8) | v4[1], (v4[2] << 8) | v4[3]];
+		str = `${str.slice(0, lastColon + 1)}0:0`;
+	}
+
+	const halves = str.split("::");
+	if (halves.length > 2) return null;
+	const head = halves[0] ? halves[0].split(":") : [];
+	let groups: string[];
+	if (halves.length === 2) {
+		const tail = halves[1] ? halves[1].split(":") : [];
+		const fill = 8 - head.length - tail.length;
+		if (fill < 1) return null;
+		groups = [...head, ...Array<string>(fill).fill("0"), ...tail];
+	} else {
+		groups = head;
+	}
+	if (groups.length !== 8) return null;
+
+	const out: number[] = [];
+	for (const g of groups) {
+		if (!/^[0-9a-fA-F]{1,4}$/.test(g)) return null;
+		out.push(Number.parseInt(g, 16));
+	}
+	if (v4Tail) out.splice(6, 2, ...v4Tail);
+	return out;
+}
+
+/** client: クライアント単位の名前 / prefix: IPv6 なら /48 単位の名前 */
+function rateLimitKeys(ip: string): { client: string; prefix?: string } {
+	const v4 = parseIPv4(ip.trim());
+	if (v4) return { client: `ip4:${v4.join(".")}` };
+
+	const v6 = parseIPv6(ip);
+	if (v6) {
+		// IPv4射影アドレス（::ffff:a.b.c.d）は IPv4 として数える
+		if (v6.slice(0, 5).every((x) => x === 0) && v6[5] === 0xffff) {
+			const [hi, lo] = [v6[6], v6[7]];
+			return {
+				client: `ip4:${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`,
+			};
+		}
+		const hex = v6.map((x) => x.toString(16));
+		return {
+			client: `ip6/64:${hex.slice(0, 4).join(":")}`,
+			prefix: `ip6/48:${hex.slice(0, 3).join(":")}`,
+		};
+	}
+
+	// 解釈できない形式はそのまま数える（弾くと正当な利用者を巻き込みうる）
+	return { client: `raw:${ip}` };
+}
+
+// 数えるときのクライアントのアドレス。ふつうは CF-Connecting-IP そのもの。
+// ただしゾーンの Pseudo IPv4 が「ヘッダーを上書き」だと、IPv6 の利用者には
+// 240.0.0.0/4（クラス E。実在のクライアントには使われない）の疑似アドレスが入り、
+// 本来のアドレスは CF-Connecting-IPv6 に入る。疑似アドレスはアドレスごとに違うので、
+// そのまま数えると /64 の中で替えるだけで素通りできる。そのときだけ CF-Connecting-IPv6 を使う
+// （Pseudo IPv4 が無効なら CF-Connecting-IPv6 はクライアントが付けられるので、いつもは信じない）
+function clientIpOf(request: Request): string | null {
+	const ip = request.headers.get("CF-Connecting-IP");
+	if (!ip) return null;
+	const v4 = parseIPv4(ip.trim());
+	if (v4 && v4[0] >= 240) {
+		const v6 = request.headers.get("CF-Connecting-IPv6");
+		if (v6 && parseIPv6(v6)) return v6;
+	}
+	return ip;
+}
+
+// ============================================================================
+// レート制限 (DOによる制御)
+// 本文を読む前（admit）: クライアント（IPv4 / IPv6 /64）の上限を確かめて10秒窓に
+// 試行を記録し、通ったら IPv6 /48 と全体の上限を確かめる（こちらは何も記録しない）。
+// R2 への保存に成功したら（commit）: 各段の1時間・1日の回数とバイト数に足す。
+// 失敗したリクエストは、クライアントの10秒窓のほかは何も消費しない
+// ============================================================================
+const LIMIT_MESSAGES: Record<LimitReason, string> = {
+	burst: "Too Many Requests. Please wait before uploading again.",
+	hour: "Too Many Requests. Hourly upload limit reached. Please try again later.",
+	day: "Too Many Requests. Daily upload limit reached. Please try again tomorrow.",
+	dayBytes:
+		"Too Many Requests. Daily upload size limit reached. Please try again tomorrow.",
+};
+
+function tooManyRequests(
+	result: LimitResult,
+	scope: "client" | "network" | "global",
+): Response {
+	const message =
+		scope === "global"
+			? "Too Many Requests. The service-wide daily upload quota has been reached. Please try again later."
+			: scope === "network"
+				? "Too Many Requests. The upload limit for your network has been reached. Please try again later."
+				: LIMIT_MESSAGES[result.reason ?? "burst"];
+	return new Response(message, {
+		status: 429,
+		headers: {
+			...CORS_HEADERS,
+			"Retry-After": String(result.retryAfter ?? 10),
+			"Access-Control-Expose-Headers": "Retry-After",
+		},
+	});
+}
+
+async function callLimiter(
+	env: Env,
+	name: string,
+	body: AdmitRequest | CommitRequest,
+	url: string,
+): Promise<LimitResult> {
+	const stub = env.RATE_LIMITER.get(env.RATE_LIMITER.idFromName(name));
+	const response = await stub.fetch(url, {
+		method: "POST",
+		body: JSON.stringify(body),
+	});
+	if (!response.ok) {
+		throw new Error(`RateLimiter responded with ${response.status}`);
+	}
+	return (await response.json()) as LimitResult;
+}
+
+/**
+ * 上限内なら、保存に成功したあとで commit する RateLimiter の名前を返す。
+ * 超えていれば 429 のレスポンス
+ */
 async function checkRateLimit(
 	request: Request,
 	env: Env,
-): Promise<Response | null> {
-	const ip = request.headers.get("CF-Connecting-IP");
+	bytes: number,
+): Promise<Response | string[]> {
+	const ip = clientIpOf(request);
 	if (!ip) return textResponse("IP address header not found.", 400);
 
-	const id = env.RATE_LIMITER.idFromName(ip);
-	const stub = env.RATE_LIMITER.get(id);
+	const { client, prefix } = rateLimitKeys(ip);
+	const limits = readLimits(env);
+	const factor = limits.prefix48Factor;
 
-	// DOの checkLimit 呼び出し
-	const response = await stub.fetch(request.url, {
-		method: "POST",
-		body: JSON.stringify({ action: "checkLimit" }),
-	});
-	const limitResult = (await response.json()) as RateLimitResult;
-	if (!limitResult.allowed) {
-		return textResponse(
-			"Too Many Requests. Please wait before uploading again.",
-			429,
-		);
+	// クライアントを先に確かめる。連打で断られるリクエストを全体用の1インスタンスへ流さないため
+	const clientResult = await callLimiter(
+		env,
+		client,
+		{
+			action: "admit",
+			bytes,
+			burst: BURST_LIMIT,
+			hour: limits.perHour,
+			day: limits.perDay,
+			dayBytes: limits.perClientDailyBytes,
+		},
+		request.url,
+	);
+	if (!clientResult.allowed) return tooManyRequests(clientResult, "client");
+
+	// /48 と全体は確かめるだけ（何も記録しない）なので並べて問い合わせる
+	const [prefixResult, globalResult] = await Promise.all([
+		prefix
+			? callLimiter(
+					env,
+					prefix,
+					{
+						action: "admit",
+						bytes,
+						hour: limits.perHour * factor,
+						day: limits.perDay * factor,
+						dayBytes: limits.perClientDailyBytes * factor,
+					},
+					request.url,
+				)
+			: null,
+		callLimiter(
+			env,
+			GLOBAL_LIMITER_NAME,
+			{
+				action: "admit",
+				bytes,
+				day: limits.globalDailyUploads,
+				dayBytes: limits.globalDailyBytes,
+			},
+			request.url,
+		),
+	]);
+	if (prefixResult && !prefixResult.allowed) {
+		console.warn(`Prefix limit (${prefixResult.reason}): ${prefix}`);
+		return tooManyRequests(prefixResult, "network");
 	}
-	console.log(`IP: ${ip}, Remaining uploads: ${limitResult.remaining}`);
-	return null;
+	if (!globalResult.allowed) {
+		console.warn(`Global daily quota reached (${globalResult.reason}).`);
+		return tooManyRequests(globalResult, "global");
+	}
+
+	console.log(
+		`Client: ${client}, uploads this hour: ${clientResult.hourCount}, today: ${clientResult.dayCount} (${clientResult.dayBytes} bytes), global today: ${globalResult.dayCount} (${globalResult.dayBytes} bytes)`,
+	);
+	return prefix
+		? [client, prefix, GLOBAL_LIMITER_NAME]
+		: [client, GLOBAL_LIMITER_NAME];
+}
+
+// 保存に成功したアップロードを、admit した各段の1時間・1日の窓に足す。
+// レスポンスを返したあとに ctx.waitUntil で動かす。失敗してもアップロード自体は成功なのでログだけ
+async function commitUsage(
+	env: Env,
+	names: string[],
+	bytes: number,
+	url: string,
+): Promise<void> {
+	const results = await Promise.allSettled(
+		names.map((name) =>
+			callLimiter(env, name, { action: "commit", bytes }, url),
+		),
+	);
+	results.forEach((r, i) => {
+		if (r.status === "rejected") {
+			console.error(`RateLimiter commit failed (${names[i]}):`, r.reason);
+		}
+	});
+}
+
+// ============================================================================
+// 本文の読み込み (上限つき)
+// Content-Length が無い（chunked）ときも、読みながら積算して上限で打ち切る。
+// 上限を超えたら null
+// ============================================================================
+function concatChunks(
+	chunks: Uint8Array[],
+	total: number,
+): Uint8Array<ArrayBuffer> {
+	const out = new Uint8Array(total);
+	let offset = 0;
+	for (const chunk of chunks) {
+		out.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return out;
+}
+
+async function readBodyWithLimit(
+	request: Request,
+	limit: number,
+): Promise<Uint8Array<ArrayBuffer> | null> {
+	if (!request.body) return new Uint8Array(0);
+	const reader = request.body.getReader();
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	while (true) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		total += value.byteLength;
+		if (total > limit) {
+			await reader.cancel();
+			return null;
+		}
+		chunks.push(value);
+	}
+	return concatChunks(chunks, total);
+}
+
+// Content-Length の値。無ければ null、数値として不正なら NaN
+function declaredBodyLength(request: Request): number | null {
+	const header = request.headers.get("Content-Length");
+	if (header === null) return null;
+	return /^\d+$/.test(header.trim()) ? Number(header.trim()) : Number.NaN;
 }
 
 // ============================================================================
@@ -215,7 +595,7 @@ async function verifyAndMarkHash(
 	if (!requestHash) return textResponse("Missing X-Request-Hash header.", 400);
 
 	const calculatedHash = await sha256(payload + env.UPLOAD_SECRET_PEPPER);
-	if (calculatedHash !== requestHash) {
+	if (!safeEqual(calculatedHash, requestHash)) {
 		console.warn(
 			`Hash mismatch! Calculated: ${calculatedHash}, Received: ${requestHash}`,
 		);
@@ -249,7 +629,7 @@ async function verifyAndMarkHash(
 // 上限超過またはgzipとして不正なら null
 // ============================================================================
 async function gunzipWithLimit(
-	buffer: ArrayBuffer,
+	buffer: Uint8Array<ArrayBuffer>,
 	limit: number,
 ): Promise<Uint8Array | null> {
 	const stream = new Response(buffer).body?.pipeThrough(
@@ -277,13 +657,7 @@ async function gunzipWithLimit(
 		return null;
 	}
 
-	const decoded = new Uint8Array(total);
-	let offset = 0;
-	for (const chunk of chunks) {
-		decoded.set(chunk, offset);
-		offset += chunk.byteLength;
-	}
-	return decoded;
+	return concatChunks(chunks, total);
 }
 
 const uploadedResponse = (link: string, key: string, deleteToken: string) =>
@@ -296,10 +670,24 @@ const uploadedResponse = (link: string, key: string, deleteToken: string) =>
 
 // ============================================================================
 // 画像アップロード (POST /)
+// body は上限つきで読み込み済みのもの（fetch 側の readBodyWithLimit）
 // ============================================================================
-async function handleImageUpload(request: Request, env: Env): Promise<Response> {
+const imageTooLarge = (max: number) =>
+	textResponse(`File size must be less than ${max / 1024 / 1024}MB.`, 413);
+
+// base64 文字列からデコード後のバイト数を求める（atob の前にサイズを弾くため）
+function base64DecodedLength(base64: string): number {
+	const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0;
+	return Math.floor((base64.length * 3) / 4) - padding;
+}
+
+async function handleImageUpload(
+	request: Request,
+	env: Env,
+	body: Uint8Array<ArrayBuffer>,
+): Promise<Response> {
 	// --- リクエストBody処理 ---
-	const bodyText = await request.text();
+	const bodyText = new TextDecoder().decode(body);
 	const formData = new URLSearchParams(bodyText);
 	const nsfwCheck = formData.get("nsfwCheck");
 	const base64Image = formData.get("image");
@@ -307,21 +695,16 @@ async function handleImageUpload(request: Request, env: Env): Promise<Response> 
 		return textResponse("Missing 'image' parameter in body.", 400);
 	}
 
+	// --- サイズ検証 (デコードせずに base64 の長さから計算する) ---
+	if (base64DecodedLength(base64Image) > MAX_FILE_SIZE) {
+		return imageTooLarge(MAX_FILE_SIZE);
+	}
+
 	// --- リプレイ攻撃対策 ---
 	const replayError = await verifyAndMarkHash(request, env, base64Image);
 	if (replayError) return replayError;
 
-	// --- Base64デコード & バリデーション ---
-	const binaryData = atob(base64Image);
-	const len = binaryData.length;
-	if (len > MAX_FILE_SIZE) {
-		return textResponse(
-			`File size must be less than ${MAX_FILE_SIZE / 1024 / 1024}MB.`,
-			413,
-		);
-	}
-
-	// バイナリへ変換
+	// --- Base64デコード (1回だけ) & バイナリへ変換 ---
 	const imageBuffer: Uint8Array | null = (() => {
 		try {
 			const decoded = atob(base64Image);
@@ -341,6 +724,18 @@ async function handleImageUpload(request: Request, env: Env): Promise<Response> 
 	return storeImage(env, imageBuffer, nsfwCheck === "1");
 }
 
+// nonce の形式検証（本文を読む前に行う）。不正ならエラーレスポンス
+function nonceOf(url: URL): string | Response {
+	const nonce = url.searchParams.get("nonce") ?? "";
+	if (!NONCE_PATTERN.test(nonce)) {
+		return textResponse(
+			"Missing or malformed 'nonce' parameter (8-64 chars of [0-9A-Za-z_-]).",
+			400,
+		);
+	}
+	return nonce;
+}
+
 // ============================================================================
 // 画像アップロード (POST /image?nonce=xxx[&nsfwCheck=1])
 // bodyは画像のバイト列そのもの。base64 で送る従来の POST / と比べて
@@ -349,29 +744,17 @@ async function handleImageUpload(request: Request, env: Env): Promise<Response> 
 // 署名は `image\n${nonce}\n${本体のSHA-256}` + PEPPER。
 // nonce を含めるので、同じ画像を上げ直しても（投稿失敗からの再送、同じアイコンの付け直し）
 // リプレイ検知で 403 にならない。nonce自体が署名対象なのでリクエストの使い回しは弾かれる。
+// body は上限（MAX_RAW_IMAGE_SIZE）つきで読み込み済みのもの
 // ============================================================================
 async function handleRawImageUpload(
 	request: Request,
 	env: Env,
 	url: URL,
+	nonce: string,
+	buffer: Uint8Array<ArrayBuffer>,
 ): Promise<Response> {
-	const nonce = url.searchParams.get("nonce") ?? "";
-	if (!NONCE_PATTERN.test(nonce)) {
-		return textResponse(
-			"Missing or malformed 'nonce' parameter (8-64 chars of [0-9A-Za-z_-]).",
-			400,
-		);
-	}
-
-	const buffer = await request.arrayBuffer();
 	if (buffer.byteLength === 0) {
 		return textResponse("Empty request body.", 400);
-	}
-	if (buffer.byteLength > MAX_RAW_IMAGE_SIZE) {
-		return textResponse(
-			`File size must be less than ${MAX_RAW_IMAGE_SIZE / 1024 / 1024}MB.`,
-			413,
-		);
 	}
 
 	const bodyDigest = await sha256Bytes(buffer);
@@ -382,11 +765,7 @@ async function handleRawImageUpload(
 	);
 	if (replayError) return replayError;
 
-	return storeImage(
-		env,
-		new Uint8Array(buffer),
-		url.searchParams.get("nsfwCheck") === "1",
-	);
+	return storeImage(env, buffer, url.searchParams.get("nsfwCheck") === "1");
 }
 
 // マジックバイト判定 → (任意)AIモデレーション → R2保存。キーは必ずサーバーで作る
@@ -492,11 +871,15 @@ async function storeImage(
 // R2には圧縮されたまま保存し Content-Encoding: gzip を付ける。
 // こうすると読み出し側の fetch() をブラウザが透過的に展開してくれる。
 // ============================================================================
-async function handleTextUpload(
-	request: Request,
-	env: Env,
-	url: URL,
-): Promise<Response> {
+interface TextUploadParams {
+	kind: string;
+	config: TextKindConfig;
+	nonce: string;
+	gzipped: boolean;
+}
+
+// kind と nonce の検証（本文を読む前に行う）。不正ならエラーレスポンス
+function textUploadParamsOf(url: URL): TextUploadParams | Response {
 	const kind = url.searchParams.get("kind") ?? "";
 	const config = Object.prototype.hasOwnProperty.call(TEXT_KINDS, kind)
 		? TEXT_KINDS[kind]
@@ -512,28 +895,33 @@ async function handleTextUpload(
 	// --- nonce ---
 	// 同じ本文を上げ直しても403にならないようにする。
 	// nonce自体は署名に含むので、リクエストまるごとの使い回しは従来どおり弾かれる
-	const nonce = url.searchParams.get("nonce") ?? "";
-	if (!NONCE_PATTERN.test(nonce)) {
-		return textResponse(
-			"Missing or malformed 'nonce' parameter (8-64 chars of [0-9A-Za-z_-]).",
-			400,
-		);
-	}
+	const nonce = nonceOf(url);
+	if (nonce instanceof Response) return nonce;
 
-	// --- 転送サイズ検証 (展開前のバイト長で弾く) ---
-	const buffer = await request.arrayBuffer();
+	return { kind, config, nonce, gzipped };
+}
+
+const textTooLarge = ({ kind, config }: TextUploadParams) =>
+	textResponse(
+		`Payload of kind '${kind}' must be less than ${config.maxBytes / 1024}KB.`,
+		413,
+	);
+
+// body は転送サイズの上限（config.maxBytes）つきで読み込み済みのもの
+async function handleTextUpload(
+	request: Request,
+	env: Env,
+	params: TextUploadParams,
+	buffer: Uint8Array<ArrayBuffer>,
+): Promise<Response> {
+	const { kind, config, nonce, gzipped } = params;
+
 	if (buffer.byteLength === 0) {
 		return textResponse("Empty request body.", 400);
 	}
-	if (buffer.byteLength > config.maxBytes) {
-		return textResponse(
-			`Payload of kind '${kind}' must be less than ${config.maxBytes / 1024}KB.`,
-			413,
-		);
-	}
 
 	// --- gzipなら展開 (展開後サイズも上限で打ち切る) ---
-	let decoded: ArrayBuffer | Uint8Array = buffer;
+	let decoded: Uint8Array = buffer;
 	if (gzipped) {
 		const gunzipped = await gunzipWithLimit(buffer, config.maxDecodedBytes);
 		if (!gunzipped) {
@@ -643,15 +1031,72 @@ export default {
 		// アップロード処理 (POST)
 		// ====================================================================
 		if (request.method === "POST") {
-			// --- レート制限 ---
-			const limitError = await checkRateLimit(request, env);
-			if (limitError) return limitError;
-
 			try {
-				if (path === "/text") return await handleTextUpload(request, env, url);
-				if (path === "/image")
-					return await handleRawImageUpload(request, env, url);
-				return await handleImageUpload(request, env);
+				// --- 本文を読む前の検証 (kind・nonce) と、経路ごとの本文の上限 ---
+				// 不正なものはレート制限の枠を消費させずに返す
+				let plan: {
+					maxBytes: number;
+					tooLarge: () => Response;
+					run: (body: Uint8Array<ArrayBuffer>) => Promise<Response>;
+				};
+				if (path === "/text") {
+					const params = textUploadParamsOf(url);
+					if (params instanceof Response) return params;
+					plan = {
+						maxBytes: params.config.maxBytes,
+						tooLarge: () => textTooLarge(params),
+						run: (body) => handleTextUpload(request, env, params, body),
+					};
+				} else if (path === "/image") {
+					const nonce = nonceOf(url);
+					if (nonce instanceof Response) return nonce;
+					plan = {
+						maxBytes: MAX_RAW_IMAGE_SIZE,
+						tooLarge: () => imageTooLarge(MAX_RAW_IMAGE_SIZE),
+						run: (body) => handleRawImageUpload(request, env, url, nonce, body),
+					};
+				} else {
+					plan = {
+						maxBytes: MAX_FORM_BODY_SIZE,
+						tooLarge: () => imageTooLarge(MAX_FILE_SIZE),
+						run: (body) => handleImageUpload(request, env, body),
+					};
+				}
+
+				// --- 宣言サイズで先に弾く (本文はまだ読まない) ---
+				const declared = declaredBodyLength(request);
+				if (Number.isNaN(declared)) {
+					return textResponse("Invalid Content-Length header.", 400);
+				}
+				if (declared !== null && declared > plan.maxBytes) {
+					return plan.tooLarge();
+				}
+
+				// --- レート制限 ---
+				// バイト数の上限は宣言サイズで確かめる（Content-Length が無ければ経路の上限いっぱい）。
+				// 実際に数えるのは保存に成功したあと
+				const limited = await checkRateLimit(
+					request,
+					env,
+					declared ?? plan.maxBytes,
+				);
+				if (limited instanceof Response) return limited;
+
+				// --- 本文を上限つきで読む (宣言より多く届いた分も打ち切る) ---
+				const body = await readBodyWithLimit(
+					request,
+					Math.min(plan.maxBytes, declared ?? plan.maxBytes),
+				);
+				if (!body) return plan.tooLarge();
+
+				const response = await plan.run(body);
+				// 200 を返すのは R2 への保存に成功したときだけ
+				if (response.status === 200) {
+					ctx.waitUntil(
+						commitUsage(env, limited, body.byteLength, request.url),
+					);
+				}
+				return response;
 			} catch (e) {
 				console.error("Upload Error:", e);
 				return textResponse(
@@ -685,7 +1130,7 @@ export default {
 			const calculatedDeleteHash = await sha256(
 				deleteId + env.DELETE_SECRET_PEPPER,
 			);
-			if (calculatedDeleteHash !== deleteHash) {
+			if (!safeEqual(calculatedDeleteHash, deleteHash)) {
 				return textResponse("Forbidden. Invalid deletion token.", 403);
 			}
 

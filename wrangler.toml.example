@@ -11,6 +11,15 @@ PUBLIC_TEXT_URL_BASE = "" # 埋める (テキストバケットの公開URL)
 CLIENT_ID = "" # 埋める
 UPLOAD_SECRET_PEPPER = "" # 埋める
 DELETE_SECRET_PEPPER = "" # 埋める
+# 以下は任意。書かなければコードの既定値（src/index.ts の DEFAULT_LIMITS）で動く。
+# 「クライアント」は IPv4 アドレス、または IPv6 の /64。1日は日本時間0時で区切る。
+# 回数・バイト数は R2 への保存に成功したアップロードだけを数える（10秒3回の連打制限は別）
+# RATE_LIMIT_PER_HOUR = "120" # クライアント1つの1時間あたりの回数
+# RATE_LIMIT_PER_DAY = "600" # クライアント1つの1日あたりの回数
+# PER_CLIENT_DAILY_BYTES = "67108864" # クライアント1つの1日あたりのバイト数 (64MB)
+# PREFIX48_FACTOR = "16" # IPv6 /48 の上限 = クライアントの上限 × この値
+# GLOBAL_DAILY_BYTES = "34359738368" # 全体の1日あたりのバイト数 (32GB)
+# GLOBAL_DAILY_UPLOADS = "300000" # 全体の1日あたりの回数
 
 [[r2_buckets]]
 binding = "BUCKET"
