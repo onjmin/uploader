@@ -768,6 +768,121 @@ async function handleRawImageUpload(
 	return storeImage(env, buffer, url.searchParams.get("nsfwCheck") === "1");
 }
 
+// ============================================================================
+// AIによる画像モデレーション（説明文を作らせて、禁止語が出たら弾く）
+//
+// モデルは廃止される（uform-gen2-qwen-500m は 2026-05-30 に廃止され、検査つきのアップロードが全部 503 になっていた）。
+// 1つのモデルに頼らず、失敗・遅延したら次のモデルで説明文を作り直す。全部だめなときだけ null。
+// ============================================================================
+
+// 単語単位で照合する（部分一致だと "bloodhound" "weaponry" などでも弾いて誤検出が増えるため）
+const BANNED_KEYWORDS =
+	/\b(feces|gore|gory|blood|bloody|vomit|weapons?|shit|self-harm)\b/i;
+
+// 弾くのは実写だけ。うんちやグロでも絵（お絵描き・漫画・イラスト）は NSFW ではないので通す。
+// 説明文に絵だと分かる語があれば絵とみなす
+const ARTWORK_KEYWORDS =
+	/\b(drawings?|drawn|cartoons?|cartoonish|illustrations?|illustrated|sketch(es|ed)?|paintings?|painted|doodles?|clip ?art|anime|manga|comics?|emojis?|icons?|stylized|animated|pixel art|digital art|artwork)\b/i;
+
+// 「排泄物は写っていない」「no blood」のような否定の文で弾かないよう、否定語を含む文は照合から外す
+const NEGATION = /\b(no|not|none|without|nor|neither|free of|absence)\b/i;
+
+const isBannedCaption = (caption: string): boolean => {
+	if (ARTWORK_KEYWORDS.test(caption)) return false;
+	return caption
+		.split(/[.\n;]+/)
+		.some(
+			(sentence) => BANNED_KEYWORDS.test(sentence) && !NEGATION.test(sentence),
+		);
+};
+
+// 絵か実写かを最初に言わせる（ARTWORK_KEYWORDS で判定できるように）。
+// 実写の排泄物を見逃さないよう、あれば明示的に書かせる（絵なら書かれても ARTWORK_KEYWORDS で通す）
+const CAPTION_PROMPT =
+	"First say whether this image is a real photograph or a drawing, illustration, or cartoon. Then give a detailed description of the image content, including objects, color, and context. If the image contains human or animal feces, excrement, or waste, describe it explicitly.";
+
+const CAPTION_TIMEOUT_MS = 15000; // 1モデルあたり。超えたら次のモデルへ（llava は混んでいると8秒を超える）
+
+// 型定義に無い新しいモデルも呼べるように、入出力は unknown で扱う
+type AiRun = (model: string, inputs: unknown) => Promise<unknown>;
+
+const toBase64 = (bytes: Uint8Array): string => {
+	let binary = "";
+	for (let i = 0; i < bytes.length; i += 0x8000) {
+		binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+	}
+	return btoa(binary);
+};
+
+// 上から順に試す。廃止されたら差し替えるか、ここに足す
+const CAPTION_MODELS: {
+	model: string;
+	run: (
+		run: AiRun,
+		image: Uint8Array,
+		mimeType: string,
+	) => Promise<string | undefined>;
+}[] = [
+	{
+		model: "@cf/moondream/moondream3.1-9B-A2B",
+		run: async (run, image, mimeType) => {
+			// caption だとプロンプトを渡せないので、query で同じ問いをする
+			const res = (await run("@cf/moondream/moondream3.1-9B-A2B", {
+				task: "query",
+				image: `data:${mimeType};base64,${toBase64(image)}`,
+				question: CAPTION_PROMPT,
+				reasoning: false,
+				stream: false, // 付けないと中身の無いオブジェクトが返ってくる
+				max_tokens: 128,
+			})) as { answer?: string; result?: { answer?: string } };
+			return res.result?.answer ?? res.answer; // 実際は result.answer に入って返ってくる
+		},
+	},
+	{
+		model: "@cf/llava-hf/llava-1.5-7b-hf",
+		run: async (run, image) => {
+			const res = (await run("@cf/llava-hf/llava-1.5-7b-hf", {
+				prompt: CAPTION_PROMPT,
+				image: Array.from(image),
+				max_tokens: 128,
+			})) as { description?: string };
+			return res.description;
+		},
+	},
+];
+
+async function captionImage(
+	env: Env,
+	image: Uint8Array,
+	mimeType: string,
+): Promise<string | null> {
+	const run = env.AI.run.bind(env.AI) as unknown as AiRun;
+	for (const { model, run: caption } of CAPTION_MODELS) {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			const text = await Promise.race([
+				caption(run, image, mimeType),
+				new Promise<never>((_, reject) => {
+					timer = setTimeout(
+						() => reject(new Error("timeout")),
+						CAPTION_TIMEOUT_MS,
+					);
+				}),
+			]);
+			if (typeof text === "string" && text.trim()) {
+				console.log(`Moderation caption (${model}): ${text.slice(0, 200)}`);
+				return text;
+			}
+			console.error(`Workers AI Moderation: empty caption from ${model}`);
+		} catch (e) {
+			console.error(`Workers AI Moderation Failed (${model}).`, e);
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+	return null;
+}
+
 // マジックバイト判定 → (任意)AIモデレーション → R2保存。キーは必ずサーバーで作る
 async function storeImage(
 	env: Env,
@@ -817,30 +932,18 @@ async function storeImage(
 
 	// --- AIによる画像モデレーション ---
 	if (nsfwCheck) {
-		const IMAGE_TO_TEXT_MODEL = "@cf/unum/uform-gen2-qwen-500m";
-		// 単語単位で照合する（部分一致だと "bloodhound" "weaponry" などでも弾いて誤検出が増えるため）
-		const BANNED_KEYWORDS =
-			/\b(feces|gore|gory|blood|bloody|vomit|weapons?|shit|self-harm)\b/i;
-		try {
-			const captionResponse = await env.AI.run(IMAGE_TO_TEXT_MODEL, {
-				// 「排泄物があれば明示的に書いて」と促すと、絵やただの茶色い物まで feces と書かれて誤検出が増えるので促さない
-				prompt:
-					"A detailed description of the image content, including objects, color, and context.",
-				image: Array.from(imageBuffer),
-			});
-			const captionText: string = captionResponse.description || "";
-			if (BANNED_KEYWORDS.test(captionText)) {
-				console.warn(`Moderation rejected. Caption: ${captionText}`);
-				return textResponse(
-					"Content policy violation: Inappropriate image detected.",
-					403,
-				);
-			}
-		} catch (e) {
-			console.error("Workers AI Moderation Failed.", e);
+		const caption = await captionImage(env, imageBuffer, mimeType);
+		if (caption === null) {
 			return textResponse(
 				"AI moderation service is temporarily unavailable.",
 				503,
+			);
+		}
+		if (isBannedCaption(caption)) {
+			console.warn(`Moderation rejected. Caption: ${caption}`);
+			return textResponse(
+				"Content policy violation: Inappropriate image detected.",
+				403,
 			);
 		}
 	}
