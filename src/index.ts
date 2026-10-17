@@ -776,28 +776,43 @@ async function handleRawImageUpload(
 // ============================================================================
 
 // 単語単位で照合する（部分一致だと "bloodhound" "weaponry" などでも弾いて誤検出が増えるため）
-// 弾くのは見て不快な実写：糞尿・血・傷やリストカット痕・死体や検死写真・グロ・裸や局部・ゴキブリ・ゲジゲジ・大量の虫・蓮コラ（小さな穴の密集）。
+// 弾くのは見て不快な実写：糞尿・血・傷やリストカット痕・人や動物の死体・検死写真・グロ・裸や局部・ゴキブリ・ゲジゲジ・大量の虫・蓮コラ（小さな穴の密集）。
 // 銃などの武器の写真は弾かない
 const BANNED_KEYWORDS =
-	/\b(feces|faeces|excrement|poop|stool|urine|vomit|shit|gore|gory|blood|bloody|bleeding|wounds?|injury|injuries|lacerations?|cuts on|scars on|self-harm|self-injury|wrist cutting|corpses?|dead bod(y|ies)|cadavers?|autopsy|morgue|mutilated|dismembered|decapitated|severed|nude|naked|nudity|genitals?|genitalia|penis|vagina|vulva|nipples?|topless|pornographic|sexual|cockroach(es)?|roach(es)?|centipedes?|millipedes?|maggots?|larvae|swarm(s|ing)?|infestation|infested|trypophobi\w*|lotus (seed )?pods?|clusters? of (small )?holes|clustered holes)\b/i;
+	/\b(feces|faeces|excrement|poop|stool|urine|vomit|shit|gore|gory|blood|bloody|bleeding|wounds?|injury|injuries|lacerations?|cuts on|scars on|self-harm|self-injury|wrist cutting|corpses?|dead bod(y|ies)|cadavers?|carcass(es)?|roadkill|carrion|decomposing|rotting|dead (animals?|birds?|cats?|kittens?|dogs?|puppies|puppy|rats?|mice|mouse|deer|rabbits?|pigeons?|crows?)|autopsy|morgue|mutilated|dismembered|decapitated|severed|nude|naked|nudity|genitals?|genitalia|penis|vagina|vulva|nipples?|topless|pornographic|sexual|cockroach(es)?|roach(es)?|centipedes?|millipedes?|maggots?|larvae|swarm(s|ing)?|infestation|infested|(hundreds|thousands|dozens|masses|mass|large numbers?|lots|many|numerous|cluster|clusters|colony|horde) of (ants|insects|bugs|flies|worms|termites|locusts|grasshoppers|beetles|spiders|larvae)|densely packed (ants|insects|bugs|termites|locusts)|trypophobi\w*|lotus (seed )?pods?|clusters? of (small )?holes|clustered holes)\b/i;
 
 // 「排泄物は写っていない」「no blood」のような否定で弾かないよう、文ごとに否定語より後ろは照合から外す。
 // 「cockroach, brown, ..., no visible feces」のように1文に被写体と否定が並ぶので、文全体は捨てない
 const NEGATION = /\b(no|not|none|without|nor|neither|free of|absence)\b/i;
 
+// 大量の虫・蓮コラは決まった語で書かれないので、同じ文に「虫」と「密集」、「穴」と「多数」がそろったら弾く
+// （「Ants ... clustered together」「numerous small holes」のように書かれる）
+const INSECTS =
+	/\b(ants|insects|bugs|flies|worms|termites|locusts|grasshoppers|beetles|spiders|larvae|caterpillars|aphids|mites|cockroaches)\b/i;
+const CROWDED =
+	/\b(clustered|cluster|clusters|swarm\w*|densely|dense|packed|crowded|mass|masses|numerous|many|hundreds|thousands|dozens|countless|covering|covered|colony|infest\w*)\b/i;
+const HOLES = /\b(holes|pits|pores|cavities|openings|perforations)\b/i;
+const MANY =
+	/\b(numerous|many|clustered|cluster|densely|dense|dozens|multiple|countless|rows of|full of|covered)\b/i;
+
 const hasBannedWord = (caption: string): boolean =>
 	caption.split(/[.\n;]+/).some((sentence) => {
 		const negated = NEGATION.exec(sentence);
-		return BANNED_KEYWORDS.test(
-			negated ? sentence.slice(0, negated.index) : sentence,
+		const text = negated ? sentence.slice(0, negated.index) : sentence;
+		return (
+			BANNED_KEYWORDS.test(text) ||
+			(INSECTS.test(text) && CROWDED.test(text)) ||
+			(HOLES.test(text) && MANY.test(text))
 		);
 	});
 
-// 不快な物を見逃さないよう、あれば BANNED_KEYWORDS の語で明示的に書かせる。
-// 一覧だけ渡すと「どれも写っていない」とだけ答えて被写体を書かないことがあるので、先に被写体を名指しさせる。
-// 例として虫の名前を書くと、関係ない画像にもその名前を書いてしまうので例は挙げない
+// 被写体を名指しさせて普通に説明させ、その説明文を BANNED_KEYWORDS で照らし合わせる。
+// - 一覧だけ渡すと「どれも写っていない」とだけ答えて被写体を書かないことがある
+// - 禁止語の一覧をプロンプトに並べると、ラーメンや風景の説明文にまで一覧を書き写して誤検出する
+// - 例として虫の名前を書くと、関係ない画像にもその名前を書いてしまう
+// なので一覧も例も挙げない。排泄物だけは、聞かないと写真でも書かないことがあるので明示させる
 const CAPTION_PROMPT =
-	"First name the main subject of the image as specifically as you can (for an animal or insect, give the common name of its species). Then give a detailed description of the image content, including objects, color, and context. Finally, if the image shows any of the following, name it explicitly with these words: feces, urine, vomit, blood, wounds, self-harm scars, gore, corpse, autopsy, nudity, genitals, cockroach, centipede, a swarm of insects or worms, maggots, or clusters of small holes (trypophobia, like a lotus seed pod).";
+	"First name the main subject of the image as specifically as you can (for an animal or insect, give the common name of its species). Then give a detailed description of the image content, including objects, color, and context. If the image contains human or animal feces, excrement, or waste, describe it explicitly.";
 
 // 弾くのは実写だけ。うんちやグロでも絵（お絵描き・漫画・イラスト）は NSFW ではないので通す。
 // 説明文の「drawing」などの語で絵とみなすと、写真にフィルターをかけて絵っぽくしただけの画像が抜けるので、
@@ -838,7 +853,7 @@ const VISION_MODELS: {
 				question: prompt,
 				reasoning: false,
 				stream: false, // 付けないと中身の無いオブジェクトが返ってくる
-				max_tokens: 128,
+				max_tokens: 200,
 			})) as { answer?: string; result?: { answer?: string } };
 			return res.result?.answer ?? res.answer; // 実際は result.answer に入って返ってくる
 		},
@@ -849,7 +864,7 @@ const VISION_MODELS: {
 			const res = (await run("@cf/llava-hf/llava-1.5-7b-hf", {
 				prompt,
 				image: Array.from(image),
-				max_tokens: 128,
+				max_tokens: 200,
 			})) as { description?: string };
 			return res.description;
 		},
@@ -874,7 +889,7 @@ async function askImage(
 				}),
 			]);
 			if (typeof text === "string" && text.trim()) {
-				console.log(`Moderation (${model}): ${text.slice(0, 200)}`);
+				console.log(`Moderation (${model}): ${text.slice(0, 1000)}`);
 				return text;
 			}
 			console.error(`Workers AI Moderation: empty answer from ${model}`);
