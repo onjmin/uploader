@@ -818,23 +818,18 @@ async function storeImage(
 	// --- AIによる画像モデレーション ---
 	if (nsfwCheck) {
 		const IMAGE_TO_TEXT_MODEL = "@cf/unum/uform-gen2-qwen-500m";
-		const BANNED_KEYWORDS = [
-			"feces",
-			"gore",
-			"blood",
-			"vomit",
-			"weapon",
-			"shit",
-			"self-harm",
-		];
+		// 単語単位で照合する（部分一致だと "bloodhound" "weaponry" などでも弾いて誤検出が増えるため）
+		const BANNED_KEYWORDS =
+			/\b(feces|gore|gory|blood|bloody|vomit|weapons?|shit|self-harm)\b/i;
 		try {
 			const captionResponse = await env.AI.run(IMAGE_TO_TEXT_MODEL, {
+				// 「排泄物があれば明示的に書いて」と促すと、絵やただの茶色い物まで feces と書かれて誤検出が増えるので促さない
 				prompt:
-					"A detailed description of the image content, including objects, color, and context. If the image contains human or animal feces, excrement, or waste, describe it explicitly.",
+					"A detailed description of the image content, including objects, color, and context.",
 				image: Array.from(imageBuffer),
 			});
 			const captionText: string = captionResponse.description || "";
-			if (BANNED_KEYWORDS.some((k) => captionText.toLowerCase().includes(k))) {
+			if (BANNED_KEYWORDS.test(captionText)) {
 				console.warn(`Moderation rejected. Caption: ${captionText}`);
 				return textResponse(
 					"Content policy violation: Inappropriate image detected.",
