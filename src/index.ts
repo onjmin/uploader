@@ -781,19 +781,23 @@ async function handleRawImageUpload(
 const BANNED_KEYWORDS =
 	/\b(feces|faeces|excrement|poop|stool|urine|vomit|shit|gore|gory|blood|bloody|bleeding|wounds?|injury|injuries|lacerations?|cuts on|scars on|self-harm|self-injury|wrist cutting|corpses?|dead bod(y|ies)|cadavers?|autopsy|morgue|mutilated|dismembered|decapitated|severed|nude|naked|nudity|genitals?|genitalia|penis|vagina|vulva|nipples?|topless|pornographic|sexual|cockroach(es)?|roach(es)?|centipedes?|millipedes?|maggots?|larvae|swarm(s|ing)?|infestation|infested|trypophobi\w*|lotus (seed )?pods?|clusters? of (small )?holes|clustered holes)\b/i;
 
-// 「排泄物は写っていない」「no blood」のような否定の文で弾かないよう、否定語を含む文は照合から外す
+// 「排泄物は写っていない」「no blood」のような否定で弾かないよう、文ごとに否定語より後ろは照合から外す。
+// 「cockroach, brown, ..., no visible feces」のように1文に被写体と否定が並ぶので、文全体は捨てない
 const NEGATION = /\b(no|not|none|without|nor|neither|free of|absence)\b/i;
 
 const hasBannedWord = (caption: string): boolean =>
-	caption
-		.split(/[.\n;]+/)
-		.some(
-			(sentence) => BANNED_KEYWORDS.test(sentence) && !NEGATION.test(sentence),
+	caption.split(/[.\n;]+/).some((sentence) => {
+		const negated = NEGATION.exec(sentence);
+		return BANNED_KEYWORDS.test(
+			negated ? sentence.slice(0, negated.index) : sentence,
 		);
+	});
 
-// 不快な物を見逃さないよう、あれば BANNED_KEYWORDS の語で明示的に書かせる
+// 不快な物を見逃さないよう、あれば BANNED_KEYWORDS の語で明示的に書かせる。
+// 一覧だけ渡すと「どれも写っていない」とだけ答えて被写体を書かないことがあるので、先に被写体を名指しさせる。
+// 例として虫の名前を書くと、関係ない画像にもその名前を書いてしまうので例は挙げない
 const CAPTION_PROMPT =
-	"Give a detailed description of the image content, including objects, color, and context. If the image contains any of the following, name it explicitly with these words: feces, urine, vomit, blood, wounds, self-harm scars, gore, corpse, autopsy, nudity, genitals, cockroach, centipede, a swarm of insects or worms, maggots, or clusters of small holes (trypophobia, like a lotus seed pod).";
+	"First name the main subject of the image as specifically as you can (for an animal or insect, give the common name of its species). Then give a detailed description of the image content, including objects, color, and context. Finally, if the image shows any of the following, name it explicitly with these words: feces, urine, vomit, blood, wounds, self-harm scars, gore, corpse, autopsy, nudity, genitals, cockroach, centipede, a swarm of insects or worms, maggots, or clusters of small holes (trypophobia, like a lotus seed pod).";
 
 // 弾くのは実写だけ。うんちやグロでも絵（お絵描き・漫画・イラスト）は NSFW ではないので通す。
 // 説明文の「drawing」などの語で絵とみなすと、写真にフィルターをかけて絵っぽくしただけの画像が抜けるので、
