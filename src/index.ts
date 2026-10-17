@@ -775,11 +775,14 @@ async function handleRawImageUpload(
 // 1つのモデルに頼らず、失敗・遅延したら次のモデルで説明文を作り直す。全部だめなときだけ null。
 //
 // どのくらい止められるか（2026-10-17、本番で Wikimedia Commons の写真を上げて確かめた。枚数が少ないので目安）
-// - 不快な実写は 9 枚中 6 枚（約7割）を遮断した
-//   - 弾けた: 犬の糞、それを漫画風に加工した版、ゴキブリ、ゲジゲジ、アリの群れ、バッタの群れ
-//   - 抜けた: 糞を鉛筆画風に強く加工した版（AI が線の模様としか見なかった）、蓮の花托 2 枚
+// - 不快な実写は 18 枚中 13 枚（約7割）を遮断した
+//   - 弾けた: 犬の糞、それを漫画風に加工した版、ゴキブリ、ゲジゲジ、アリの群れ、バッタの群れ、
+//     鼻血、ひざの傷、リストカット痕、棺の遺体、鳥の死体（ロードキル）、女性の裸、男性器
+//   - 抜けた: 糞を鉛筆画風に強く加工した版（AI が線の模様としか見なかった）、蓮の花托 2 枚、
+//     猫の死体（AI が「くつろいで寝ている猫」と見た）、動物の解剖実習
+//   - 糞・虫・蓮の花托はこの版より前のプロンプトで試した。検死の実写は良い素材が無く試していない
 // - 普通の写真 6 枚（猫・蝶・ラーメン・富士山・渋谷の交差点・犬）と絵 3 枚は全部通った
-// - 血・リストカット痕・死体・検死写真・裸や局部は、実際の画像では試していない（説明文の照合だけ確かめた）
+// - 写実的な油絵（検死の場面）は、AI が写真と判定して弾かれた。絵は通す方針だが、写実的すぎる絵は弾かれうる
 //
 // 蓮コラ（トライポフォビア：小さな穴やブツブツの密集。植物に限らない）は、検討したが止められなかった
 // - 説明文に穴の密集を書かない（蓮の花托を「睡蓮」と書く）ので、禁止語では拾えない
@@ -791,7 +794,7 @@ async function handleRawImageUpload(
 // 弾くのは見て不快な実写：糞尿・血・傷やリストカット痕・人や動物の死体・検死写真・グロ・裸や局部・ゴキブリ・ゲジゲジ・大量の虫・蓮コラ（小さな穴の密集）。
 // 銃などの武器の写真は弾かない
 const BANNED_KEYWORDS =
-	/\b(feces|faeces|excrement|poop|stool|urine|vomit|shit|gore|gory|blood|bloody|bleeding|wounds?|injury|injuries|lacerations?|cuts on|scars on|self-harm|self-injury|wrist cutting|corpses?|dead bod(y|ies)|cadavers?|carcass(es)?|roadkill|carrion|decomposing|rotting|dead (animals?|birds?|cats?|kittens?|dogs?|puppies|puppy|rats?|mice|mouse|deer|rabbits?|pigeons?|crows?)|autopsy|morgue|mutilated|dismembered|decapitated|severed|nude|naked|nudity|genitals?|genitalia|penis|vagina|vulva|nipples?|topless|pornographic|sexual|cockroach(es)?|roach(es)?|centipedes?|millipedes?|maggots?|larvae|swarm(s|ing)?|infestation|infested|(hundreds|thousands|dozens|masses|mass|large numbers?|lots|many|numerous|cluster|clusters|colony|horde) of (ants|insects|bugs|flies|worms|termites|locusts|grasshoppers|beetles|spiders|larvae)|densely packed (ants|insects|bugs|termites|locusts)|trypophobi\w*|lotus (seed )?pods?|clusters? of (small )?holes|clustered holes)\b/i;
+	/\b(feces|faeces|excrement|poop|stool|urine|vomit|shit|gore|gory|blood|bloody|bleeding|wounds?|injury|injuries|lacerations?|cuts on|scars on|(is|are|appears? to be|seems? to be|was|were|lying|lies) dead|deceased|lifeless|injured|self-harm|self-injury|wrist cutting|corpses?|dead bod(y|ies)|cadavers?|carcass(es)?|roadkill|carrion|decomposing|rotting|dead (animals?|birds?|cats?|kittens?|dogs?|puppies|puppy|rats?|mice|mouse|deer|rabbits?|pigeons?|crows?)|autopsy|morgue|mutilated|dismembered|decapitated|severed|nude|naked|nudity|genitals?|genitalia|penis|vagina|vulva|nipples?|topless|pornographic|sexual|cockroach(es)?|roach(es)?|centipedes?|millipedes?|maggots?|larvae|swarm(s|ing)?|infestation|infested|(hundreds|thousands|dozens|masses|mass|large numbers?|lots|many|numerous|cluster|clusters|colony|horde) of (ants|insects|bugs|flies|worms|termites|locusts|grasshoppers|beetles|spiders|larvae)|densely packed (ants|insects|bugs|termites|locusts)|trypophobi\w*|lotus (seed )?pods?|clusters? of (small )?holes|clustered holes)\b/i;
 
 // 「排泄物は写っていない」「no blood」のような否定で弾かないよう、文ごとに否定語より後ろは照合から外す。
 // 「cockroach, brown, ..., no visible feces」のように1文に被写体と否定が並ぶので、文全体は捨てない
@@ -807,6 +810,11 @@ const HOLES = /\b(holes|pits|pores|cavities|openings|perforations)\b/i;
 const MANY =
 	/\b(numerous|many|clustered|cluster|densely|dense|dozens|multiple|countless|rows of|full of|covered)\b/i;
 
+// リストカット痕は「腕の平行な赤紫の引っかき傷」のように書かれるので、同じ文に「傷」と「腕など」がそろったら弾く
+const SCARS = /\b(cuts|scars|scratches|slashes|lacerations|gashes)\b/i;
+const LIMBS =
+	/\b(arms?|forearms?|wrists?|skin|thighs?|legs?|hands?|stomach|abdomen)\b/i;
+
 const hasBannedWord = (caption: string): boolean =>
 	caption.split(/[.\n;]+/).some((sentence) => {
 		const negated = NEGATION.exec(sentence);
@@ -814,7 +822,8 @@ const hasBannedWord = (caption: string): boolean =>
 		return (
 			BANNED_KEYWORDS.test(text) ||
 			(INSECTS.test(text) && CROWDED.test(text)) ||
-			(HOLES.test(text) && MANY.test(text))
+			(HOLES.test(text) && MANY.test(text)) ||
+			(SCARS.test(text) && LIMBS.test(text))
 		);
 	});
 
@@ -822,9 +831,10 @@ const hasBannedWord = (caption: string): boolean =>
 // - 一覧だけ渡すと「どれも写っていない」とだけ答えて被写体を書かないことがある
 // - 禁止語の一覧をプロンプトに並べると、ラーメンや風景の説明文にまで一覧を書き写して誤検出する
 // - 例として虫の名前を書くと、関係ない画像にもその名前を書いてしまう
-// なので一覧も例も挙げない。排泄物だけは、聞かないと写真でも書かないことがあるので明示させる
+// なので一覧も例も挙げない。排泄物と、死んでいる・けが・出血・傷跡は、聞かないと写真でも書かない
+// （猫の死体を「くつろいで寝ている猫」と書く）ので明示させる
 const CAPTION_PROMPT =
-	"First name the main subject of the image as specifically as you can (for an animal or insect, give the common name of its species). Then give a detailed description of the image content, including objects, color, and context. If the image contains human or animal feces, excrement, or waste, describe it explicitly.";
+	"First name the main subject of the image as specifically as you can (for an animal or insect, give the common name of its species). Then give a detailed description of the image content, including objects, color, and context. If the image contains human or animal feces, excrement, or waste, describe it explicitly. If any person or animal in the image is dead, injured, bleeding, or has wounds, cuts, or scars, say so explicitly.";
 
 // 弾くのは実写だけ。うんちやグロでも絵（お絵描き・漫画・イラスト）は NSFW ではないので通す。
 // 説明文の「drawing」などの語で絵とみなすと、写真にフィルターをかけて絵っぽくしただけの画像が抜けるので、
