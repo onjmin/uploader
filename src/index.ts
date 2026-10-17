@@ -776,32 +776,32 @@ async function handleRawImageUpload(
 // ============================================================================
 
 // 単語単位で照合する（部分一致だと "bloodhound" "weaponry" などでも弾いて誤検出が増えるため）
+// 弾くのは見て不快な実写：糞尿・血・傷やリストカット痕・死体や検死写真・グロ・裸や局部・ゴキブリ・ゲジゲジ・大量の虫・蓮コラ（小さな穴の密集）。
+// 銃などの武器の写真は弾かない
 const BANNED_KEYWORDS =
-	/\b(feces|gore|gory|blood|bloody|vomit|weapons?|shit|self-harm)\b/i;
-
-// 弾くのは実写だけ。うんちやグロでも絵（お絵描き・漫画・イラスト）は NSFW ではないので通す。
-// 説明文に絵だと分かる語があれば絵とみなす
-const ARTWORK_KEYWORDS =
-	/\b(drawings?|drawn|cartoons?|cartoonish|illustrations?|illustrated|sketch(es|ed)?|paintings?|painted|doodles?|clip ?art|anime|manga|comics?|emojis?|icons?|stylized|animated|pixel art|digital art|artwork)\b/i;
+	/\b(feces|faeces|excrement|poop|stool|urine|vomit|shit|gore|gory|blood|bloody|bleeding|wounds?|injury|injuries|lacerations?|cuts on|scars on|self-harm|self-injury|wrist cutting|corpses?|dead bod(y|ies)|cadavers?|autopsy|morgue|mutilated|dismembered|decapitated|severed|nude|naked|nudity|genitals?|genitalia|penis|vagina|vulva|nipples?|topless|pornographic|sexual|cockroach(es)?|roach(es)?|centipedes?|millipedes?|maggots?|larvae|swarm(s|ing)?|infestation|infested|trypophobi\w*|lotus (seed )?pods?|clusters? of (small )?holes|clustered holes)\b/i;
 
 // 「排泄物は写っていない」「no blood」のような否定の文で弾かないよう、否定語を含む文は照合から外す
 const NEGATION = /\b(no|not|none|without|nor|neither|free of|absence)\b/i;
 
-const isBannedCaption = (caption: string): boolean => {
-	if (ARTWORK_KEYWORDS.test(caption)) return false;
-	return caption
+const hasBannedWord = (caption: string): boolean =>
+	caption
 		.split(/[.\n;]+/)
 		.some(
 			(sentence) => BANNED_KEYWORDS.test(sentence) && !NEGATION.test(sentence),
 		);
-};
 
-// 絵か実写かを最初に言わせる（ARTWORK_KEYWORDS で判定できるように）。
-// 実写の排泄物を見逃さないよう、あれば明示的に書かせる（絵なら書かれても ARTWORK_KEYWORDS で通す）
+// 不快な物を見逃さないよう、あれば BANNED_KEYWORDS の語で明示的に書かせる
 const CAPTION_PROMPT =
-	"First say whether this image is a real photograph or a drawing, illustration, or cartoon. Then give a detailed description of the image content, including objects, color, and context. If the image contains human or animal feces, excrement, or waste, describe it explicitly.";
+	"Give a detailed description of the image content, including objects, color, and context. If the image contains any of the following, name it explicitly with these words: feces, urine, vomit, blood, wounds, self-harm scars, gore, corpse, autopsy, nudity, genitals, cockroach, centipede, a swarm of insects or worms, maggots, or clusters of small holes (trypophobia, like a lotus seed pod).";
 
-const CAPTION_TIMEOUT_MS = 15000; // 1モデルあたり。超えたら次のモデルへ（llava は混んでいると8秒を超える）
+// 弾くのは実写だけ。うんちやグロでも絵（お絵描き・漫画・イラスト）は NSFW ではないので通す。
+// 説明文の「drawing」などの語で絵とみなすと、写真にフィルターをかけて絵っぽくしただけの画像が抜けるので、
+// 禁止語が出たときだけ「元が写真か」を名指しで聞き直す
+const PHOTO_PROMPT =
+	"Is this image a photograph or a drawing? If it is a photograph with a filter or effect applied to make it look like a drawing, painting, sketch, or cartoon, it is still a photograph. Answer with one word: PHOTO or DRAWING.";
+
+const MODEL_TIMEOUT_MS = 15000; // 1モデルあたり。超えたら次のモデルへ（llava は混んでいると8秒を超える）
 
 // 型定義に無い新しいモデルも呼べるように、入出力は unknown で扱う
 type AiRun = (model: string, inputs: unknown) => Promise<unknown>;
@@ -815,22 +815,23 @@ const toBase64 = (bytes: Uint8Array): string => {
 };
 
 // 上から順に試す。廃止されたら差し替えるか、ここに足す
-const CAPTION_MODELS: {
+const VISION_MODELS: {
 	model: string;
-	run: (
+	ask: (
 		run: AiRun,
 		image: Uint8Array,
 		mimeType: string,
+		prompt: string,
 	) => Promise<string | undefined>;
 }[] = [
 	{
 		model: "@cf/moondream/moondream3.1-9B-A2B",
-		run: async (run, image, mimeType) => {
-			// caption だとプロンプトを渡せないので、query で同じ問いをする
+		ask: async (run, image, mimeType, prompt) => {
+			// caption だとプロンプトを渡せないので query で聞く
 			const res = (await run("@cf/moondream/moondream3.1-9B-A2B", {
 				task: "query",
 				image: `data:${mimeType};base64,${toBase64(image)}`,
-				question: CAPTION_PROMPT,
+				question: prompt,
 				reasoning: false,
 				stream: false, // 付けないと中身の無いオブジェクトが返ってくる
 				max_tokens: 128,
@@ -840,9 +841,9 @@ const CAPTION_MODELS: {
 	},
 	{
 		model: "@cf/llava-hf/llava-1.5-7b-hf",
-		run: async (run, image) => {
+		ask: async (run, image, _mimeType, prompt) => {
 			const res = (await run("@cf/llava-hf/llava-1.5-7b-hf", {
-				prompt: CAPTION_PROMPT,
+				prompt,
 				image: Array.from(image),
 				max_tokens: 128,
 			})) as { description?: string };
@@ -851,29 +852,28 @@ const CAPTION_MODELS: {
 	},
 ];
 
-async function captionImage(
+// 画像について聞く。失敗・遅延したら次のモデルで聞き直し、全部だめなときだけ null
+async function askImage(
 	env: Env,
 	image: Uint8Array,
 	mimeType: string,
+	prompt: string,
 ): Promise<string | null> {
 	const run = env.AI.run.bind(env.AI) as unknown as AiRun;
-	for (const { model, run: caption } of CAPTION_MODELS) {
+	for (const { model, ask } of VISION_MODELS) {
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		try {
 			const text = await Promise.race([
-				caption(run, image, mimeType),
+				ask(run, image, mimeType, prompt),
 				new Promise<never>((_, reject) => {
-					timer = setTimeout(
-						() => reject(new Error("timeout")),
-						CAPTION_TIMEOUT_MS,
-					);
+					timer = setTimeout(() => reject(new Error("timeout")), MODEL_TIMEOUT_MS);
 				}),
 			]);
 			if (typeof text === "string" && text.trim()) {
-				console.log(`Moderation caption (${model}): ${text.slice(0, 200)}`);
+				console.log(`Moderation (${model}): ${text.slice(0, 200)}`);
 				return text;
 			}
-			console.error(`Workers AI Moderation: empty caption from ${model}`);
+			console.error(`Workers AI Moderation: empty answer from ${model}`);
 		} catch (e) {
 			console.error(`Workers AI Moderation Failed (${model}).`, e);
 		} finally {
@@ -881,6 +881,26 @@ async function captionImage(
 		}
 	}
 	return null;
+}
+
+type ModerationResult = "ok" | "banned" | "unavailable";
+
+async function moderateImage(
+	env: Env,
+	image: Uint8Array,
+	mimeType: string,
+): Promise<ModerationResult> {
+	const caption = await askImage(env, image, mimeType, CAPTION_PROMPT);
+	if (caption === null) return "unavailable";
+	if (!hasBannedWord(caption)) return "ok";
+	// 禁止語が出たときだけ、元が写真かを聞き直す。はっきり絵（DRAWING）と言わない限り弾く。
+	// YES/NO で聞くと実写にも NO と答えたので、二択で聞く
+	const photo = await askImage(env, image, mimeType, PHOTO_PROMPT);
+	if (photo !== null && /drawing/i.test(photo) && !/photo/i.test(photo)) {
+		return "ok";
+	}
+	console.warn(`Moderation rejected. Caption: ${caption} / Photo: ${photo}`);
+	return "banned";
 }
 
 // マジックバイト判定 → (任意)AIモデレーション → R2保存。キーは必ずサーバーで作る
@@ -932,15 +952,14 @@ async function storeImage(
 
 	// --- AIによる画像モデレーション ---
 	if (nsfwCheck) {
-		const caption = await captionImage(env, imageBuffer, mimeType);
-		if (caption === null) {
+		const result = await moderateImage(env, imageBuffer, mimeType);
+		if (result === "unavailable") {
 			return textResponse(
 				"AI moderation service is temporarily unavailable.",
 				503,
 			);
 		}
-		if (isBannedCaption(caption)) {
-			console.warn(`Moderation rejected. Caption: ${caption}`);
+		if (result === "banned") {
 			return textResponse(
 				"Content policy violation: Inappropriate image detected.",
 				403,
